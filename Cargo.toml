@@ -1,0 +1,20 @@
+[package]
+name = "uniffier"
+version = "0.1.0"
+edition = "2024"
+description = "A CLI tool for bootstrapping and managing Rust FFI projects"
+license = "MIT"
+
+[[bin]]
+name = "ffi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+dialoguer = "0.11"
+git2 = "0.20"
+toml_edit = "0.22"
+tempfile = "3"
+walkdir = "2"

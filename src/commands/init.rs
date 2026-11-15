@@ -27,7 +27,7 @@ pub struct InitArgs {
     pub demo: bool,
 
     /// Overwrite existing files that collide with template files
-    #[arg(long)]
+    #[arg(long, short = 'f')]
     pub force: bool,
 }
 

@@ -142,23 +142,49 @@ pub fn templatize(project_dir: &Path, project_name: &str) -> Result<()> {
 }
 
 pub fn strip_example_crates(project_dir: &Path, project_name: &str) -> Result<()> {
-    let examples_to_remove = ["complex", "polynomials", "linear-algebra", "trig", "sequences"];
+    let keep_ffi = [
+        format!("{project_name}-ffi"),
+        "types".to_string(),
+        "tools".to_string(),
+        project_name.replace('-', "_"),
+        project_name.to_string(),
+    ];
 
-    for name in &examples_to_remove {
-        let lib_crate = project_dir.join("crates/lib").join(name);
-        if lib_crate.exists() {
-            fs::remove_dir_all(&lib_crate)
-                .with_context(|| format!("failed to remove crates/lib/{name}"))?;
-        }
+    let project_name_underscore = project_name.replace('-', "_");
+    let keep_lib = [
+        project_name.to_string(),
+        project_name_underscore,
+    ];
 
-        let ffi_crate = project_dir.join("crates/ffi").join(name);
-        if ffi_crate.exists() {
-            fs::remove_dir_all(&ffi_crate)
-                .with_context(|| format!("failed to remove crates/ffi/{name}"))?;
+    let mut removed = Vec::new();
+
+    let ffi_dir = project_dir.join("crates/ffi");
+    if ffi_dir.is_dir() {
+        for entry in fs::read_dir(&ffi_dir)? {
+            let entry = entry?;
+            let name_str = entry.file_name().to_string_lossy().to_string();
+            if entry.path().is_dir() && !keep_ffi.iter().any(|k| k == &name_str) {
+                removed.push(name_str.clone());
+                fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("failed to remove crates/ffi/{name_str}"))?;
+            }
         }
     }
 
-    rewrite_workspace_toml(project_dir)?;
+    let lib_dir = project_dir.join("crates/lib");
+    if lib_dir.is_dir() {
+        for entry in fs::read_dir(&lib_dir)? {
+            let entry = entry?;
+            let name_str = entry.file_name().to_string_lossy().to_string();
+            if entry.path().is_dir() && !keep_lib.iter().any(|k| k == &name_str) {
+                removed.push(name_str.clone());
+                fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("failed to remove crates/lib/{name_str}"))?;
+            }
+        }
+    }
+
+    rewrite_workspace_toml(project_dir, &removed)?;
     write_skeleton_examples(project_dir, project_name)?;
     strip_docs(project_dir)?;
 
@@ -402,7 +428,7 @@ fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()>
     Ok(())
 }
 
-fn rewrite_workspace_toml(project_dir: &Path) -> Result<()> {
+fn rewrite_workspace_toml(project_dir: &Path, removed_crates: &[String]) -> Result<()> {
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let content = fs::read_to_string(&cargo_toml_path).context("failed to read Cargo.toml")?;
 
@@ -415,18 +441,11 @@ fn rewrite_workspace_toml(project_dir: &Path) -> Result<()> {
         .and_then(|w| w.get_mut("dependencies"))
         .and_then(|d| d.as_table_like_mut())
     {
-        let removed_crate_fragments = [
-            "complex", "polynomials", "linear-algebra", "trig", "sequences",
-        ];
-
         let keys_to_remove: Vec<String> = deps
             .iter()
             .filter_map(|(k, _)| {
                 let key = k.to_string();
-                if removed_crate_fragments
-                    .iter()
-                    .any(|frag| key.contains(frag))
-                {
+                if removed_crates.iter().any(|name| key.contains(name.as_str())) {
                     Some(key)
                 } else {
                     None

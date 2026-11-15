@@ -21,8 +21,12 @@ pub struct MigrateArgs {
     pub yes: bool,
 
     /// Overwrite existing files that collide with template files
-    #[arg(long)]
+    #[arg(long, short = 'f')]
     pub force: bool,
+
+    /// Include demo example crates and apps from the template
+    #[arg(long)]
+    pub demo: bool,
 
     /// Project directory (defaults to current directory)
     #[arg(default_value = ".")]
@@ -97,6 +101,11 @@ fn migrate_single_crate(
 
     eprintln!("  Copying template assets (Makefile, scripts, templates, tools)...");
     clone_template_assets(project_dir, args)?;
+
+    if args.demo {
+        eprintln!("  Applying project name to demo files...");
+        template::templatize(project_dir, crate_name)?;
+    }
 
     eprintln!("{} Migration complete.", style("✓").green());
     eprintln!();
@@ -227,6 +236,16 @@ fn migrate_workspace(
     eprintln!("  Copying template assets...");
     clone_template_assets(project_dir, args)?;
 
+    if args.demo {
+        let project_name = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
+        eprintln!("  Applying project name to demo files...");
+        template::templatize(project_dir, &project_name)?;
+    }
+
     eprintln!("  Updating workspace Cargo.toml...");
     add_ffi_to_workspace_toml(project_dir, &crates_to_wrap)?;
 
@@ -276,6 +295,24 @@ fn discover_workspace_crates(project_dir: &Path, members: &[String]) -> Result<V
     Ok(crates)
 }
 
+fn discover_demo_crates(template_ffi_dir: &Path) -> Vec<String> {
+    let skip = ["tools", "types"];
+    let mut crates = Vec::new();
+    if let Ok(entries) = fs::read_dir(template_ffi_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if entry.path().join("Cargo.toml").exists() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if !skip.contains(&name) {
+                        crates.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    crates.sort();
+    crates
+}
+
 fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
     let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
     let temp_path = template::template_clone_path(temp_dir.path());
@@ -311,6 +348,34 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
         }
     }
 
+    let demo_crates = if args.demo {
+        let crates = discover_demo_crates(&temp_path.join("crates/ffi"));
+        for dir in &["examples", "docs"] {
+            let src = temp_path.join(dir);
+            if src.exists() {
+                let collisions = collision::detect_collisions(&src, &project_dir.join(dir));
+                for rel in collisions {
+                    all_collisions.push(PathBuf::from(*dir).join(rel));
+                }
+            }
+        }
+        for name in &crates {
+            for prefix in &["crates/lib", "crates/ffi"] {
+                let rel = format!("{prefix}/{name}");
+                let src = temp_path.join(&rel);
+                if src.exists() {
+                    let collisions = collision::detect_collisions(&src, &project_dir.join(&rel));
+                    for c in collisions {
+                        all_collisions.push(PathBuf::from(&rel).join(c));
+                    }
+                }
+            }
+        }
+        crates
+    } else {
+        Vec::new()
+    };
+
     let on_collision = collision::resolve_collisions(&all_collisions, args.force, args.yes)?;
 
     for asset in &assets {
@@ -329,9 +394,7 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
     let tools_src = temp_path.join("crates/ffi/tools");
     let tools_dest = project_dir.join("crates/ffi/tools");
     if tools_src.exists() {
-        if !tools_dest.exists() {
-            template::copy_dir_recursive(&tools_src, &tools_dest, on_collision)?;
-        } else if on_collision == OnCollision::Overwrite {
+        if !tools_dest.exists() || on_collision == OnCollision::Overwrite {
             template::copy_dir_recursive(&tools_src, &tools_dest, on_collision)?;
         }
     }
@@ -354,8 +417,26 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
     } else if on_collision == OnCollision::Overwrite {
         let readme_src = temp_path.join("bindings/README.md");
         if readme_src.exists() {
-            fs::create_dir_all(&bindings_dir)?;
             fs::copy(&readme_src, bindings_dir.join("README.md"))?;
+        }
+    }
+
+    if args.demo {
+        for dir in &["examples", "docs"] {
+            let src = temp_path.join(dir);
+            let dest = project_dir.join(dir);
+            if src.exists() {
+                template::copy_dir_recursive(&src, &dest, on_collision)?;
+            }
+        }
+        for name in &demo_crates {
+            for prefix in &["crates/lib", "crates/ffi"] {
+                let src = temp_path.join(prefix).join(name);
+                let dest = project_dir.join(prefix).join(name);
+                if src.exists() {
+                    template::copy_dir_recursive(&src, &dest, on_collision)?;
+                }
+            }
         }
     }
 

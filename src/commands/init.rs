@@ -7,6 +7,7 @@ use console::style;
 
 use crate::collision;
 use crate::template;
+use crate::workspace;
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -34,9 +35,9 @@ pub struct InitArgs {
 pub fn run(args: InitArgs) -> Result<()> {
     let dest = &args.path;
 
-    if dest.join("Cargo.toml").exists() {
+    if let Some(_) = workspace::detect_project(dest)? {
         bail!(
-            "directory '{}' already contains a Cargo.toml — use `ffi migrate` to add FFI support to an existing Rust project",
+            "directory '{}' already contains a Rust project — use `ffi migrate` to add FFI support to an existing Rust project",
             dest.display()
         );
     }

@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use console::style;
 
+use crate::collision::{self, OnCollision};
 use crate::template;
 use crate::workspace::{self, ProjectKind};
 
@@ -18,6 +19,10 @@ pub struct MigrateArgs {
     /// Skip interactive prompts, use defaults
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Overwrite existing files that collide with template files
+    #[arg(long)]
+    pub force: bool,
 
     /// Project directory (defaults to current directory)
     #[arg(default_value = ".")]
@@ -272,35 +277,70 @@ fn discover_workspace_crates(project_dir: &Path, members: &[String]) -> Result<V
 }
 
 fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
-    let temp_dir = tempfile::tempdir().context("failed to create temp directory")?;
-    let temp_path = temp_dir.path();
-
-    template::clone_template(temp_path, args.template.as_deref())?;
+    let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
+    let temp_path = template::template_clone_path(temp_dir.path());
 
     let assets = ["Makefile", "scripts", "templates", ".githooks"];
+
+    let mut all_collisions = Vec::new();
+    for asset in &assets {
+        let src = temp_path.join(asset);
+        if src.exists() {
+            let asset_collisions = collision::detect_collisions(&src, &project_dir.join(asset));
+            for rel in asset_collisions {
+                all_collisions.push(PathBuf::from(asset).join(rel));
+            }
+        }
+    }
+
+    let extra_assets: &[(&str, &str)] = &[
+        ("crates/ffi/tools", "crates/ffi/tools"),
+        ("uniffi.toml", "uniffi.toml"),
+        ("bindings/README.md", "bindings/README.md"),
+    ];
+    for (src_rel, dest_rel) in extra_assets {
+        let src = temp_path.join(src_rel);
+        let dest = project_dir.join(dest_rel);
+        if src.is_file() && dest.exists() {
+            all_collisions.push(PathBuf::from(dest_rel));
+        } else if src.is_dir() {
+            let asset_collisions = collision::detect_collisions(&src, &dest);
+            for rel in asset_collisions {
+                all_collisions.push(PathBuf::from(dest_rel).join(rel));
+            }
+        }
+    }
+
+    let on_collision = collision::resolve_collisions(&all_collisions, args.force, args.yes)?;
 
     for asset in &assets {
         let src = temp_path.join(asset);
         let dest = project_dir.join(asset);
 
         if src.is_dir() {
-            copy_dir_recursive(&src, &dest)?;
-        } else if src.is_file() && !dest.exists() {
-            fs::copy(&src, &dest).with_context(|| format!("failed to copy {asset}"))?;
+            template::copy_dir_recursive(&src, &dest, on_collision)?;
+        } else if src.is_file() {
+            if !dest.exists() || on_collision == OnCollision::Overwrite {
+                fs::copy(&src, &dest).with_context(|| format!("failed to copy {asset}"))?;
+            }
         }
     }
 
     let tools_src = temp_path.join("crates/ffi/tools");
     let tools_dest = project_dir.join("crates/ffi/tools");
-    if tools_src.exists() && !tools_dest.exists() {
-        copy_dir_recursive(&tools_src, &tools_dest)?;
+    if tools_src.exists() {
+        if !tools_dest.exists() {
+            template::copy_dir_recursive(&tools_src, &tools_dest, on_collision)?;
+        } else if on_collision == OnCollision::Overwrite {
+            template::copy_dir_recursive(&tools_src, &tools_dest, on_collision)?;
+        }
     }
 
-    if !project_dir.join("uniffi.toml").exists() {
+    let uniffi_dest = project_dir.join("uniffi.toml");
+    if !uniffi_dest.exists() || on_collision == OnCollision::Overwrite {
         let uniffi_src = temp_path.join("uniffi.toml");
         if uniffi_src.exists() {
-            fs::copy(&uniffi_src, project_dir.join("uniffi.toml"))
-                .context("failed to copy uniffi.toml")?;
+            fs::copy(&uniffi_src, &uniffi_dest).context("failed to copy uniffi.toml")?;
         }
     }
 
@@ -309,6 +349,12 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
         fs::create_dir_all(&bindings_dir)?;
         let readme_src = temp_path.join("bindings/README.md");
         if readme_src.exists() {
+            fs::copy(&readme_src, bindings_dir.join("README.md"))?;
+        }
+    } else if on_collision == OnCollision::Overwrite {
+        let readme_src = temp_path.join("bindings/README.md");
+        if readme_src.exists() {
+            fs::create_dir_all(&bindings_dir)?;
             fs::copy(&readme_src, bindings_dir.join("README.md"))?;
         }
     }
@@ -572,20 +618,3 @@ fn add_ffi_to_workspace_toml(project_dir: &Path, crate_names: &[String]) -> Resu
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
-        } else {
-            fs::copy(&src_path, &dest_path)?;
-        }
-    }
-
-    Ok(())
-}

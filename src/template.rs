@@ -2,7 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tempfile::TempDir;
 use walkdir::WalkDir;
+
+use crate::collision::OnCollision;
 
 const TEMPLATE_REPO: &str = "https://github.com/amd-cmaxwell/ffi-testing.git";
 const TEMPLATE_PREFIXES: &[(&str, &str)] = &[
@@ -12,7 +15,7 @@ const TEMPLATE_PREFIXES: &[(&str, &str)] = &[
     ("uniffi-testing", "-"),
 ];
 
-pub fn clone_template(dest: &Path, template_url: Option<&str>) -> Result<()> {
+pub fn clone_template_to_temp(template_url: Option<&str>) -> Result<TempDir> {
     let url = template_url.unwrap_or(TEMPLATE_REPO);
     eprintln!("  Cloning template from {url}...");
 
@@ -28,25 +31,37 @@ pub fn clone_template(dest: &Path, template_url: Option<&str>) -> Result<()> {
         fs::remove_dir_all(&git_dir).context("failed to remove .git directory")?;
     }
 
-    fs::create_dir_all(dest)?;
-    copy_dir_contents(&clone_path, dest)
-        .context("failed to copy template into destination")?;
+    Ok(temp_dir)
+}
 
+pub fn copy_template_to_dest(
+    temp_dir: &Path,
+    dest: &Path,
+    on_collision: OnCollision,
+) -> Result<()> {
+    let clone_path = temp_dir.join("template");
+    fs::create_dir_all(dest)?;
+    copy_dir_contents(&clone_path, dest, on_collision)
+        .context("failed to copy template into destination")?;
     Ok(())
 }
 
-fn copy_dir_contents(src: &Path, dest: &Path) -> Result<()> {
+pub fn template_clone_path(temp_dir: &Path) -> std::path::PathBuf {
+    temp_dir.join("template")
+}
+
+fn copy_dir_contents(src: &Path, dest: &Path, on_collision: OnCollision) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
-        if dest_path.exists() {
+        if dest_path.exists() && on_collision == OnCollision::Skip {
             continue;
         }
 
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
+            copy_dir_recursive(&src_path, &dest_path, on_collision)?;
         } else {
             fs::copy(&src_path, &dest_path)?;
         }
@@ -54,7 +69,7 @@ fn copy_dir_contents(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+pub fn copy_dir_recursive(src: &Path, dest: &Path, on_collision: OnCollision) -> Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -62,7 +77,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
         let dest_path = dest.join(entry.file_name());
 
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
+            copy_dir_recursive(&src_path, &dest_path, on_collision)?;
+        } else if dest_path.exists() && on_collision == OnCollision::Skip {
+            continue;
         } else {
             fs::copy(&src_path, &dest_path)?;
         }

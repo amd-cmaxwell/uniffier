@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use clap::Args;
 use console::style;
 
+use crate::collision::OnCollision;
 use crate::template;
 
 #[derive(Args)]
@@ -41,7 +42,8 @@ pub fn run(args: NewArgs) -> Result<()> {
 
     std::fs::create_dir_all(&args.path)?;
 
-    template::clone_template(&args.path, args.template.as_deref())?;
+    let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
+    template::copy_template_to_dest(temp_dir.path(), &args.path, OnCollision::Skip)?;
 
     eprintln!("  Applying project name...");
     template::templatize(&args.path, &name)?;

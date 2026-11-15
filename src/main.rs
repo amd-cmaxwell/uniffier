@@ -1,3 +1,4 @@
+mod collision;
 mod commands;
 mod repo_identity;
 mod template;

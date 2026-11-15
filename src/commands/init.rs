@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use clap::Args;
 use console::style;
 
+use crate::collision;
 use crate::template;
 
 #[derive(Args)]
@@ -24,6 +25,10 @@ pub struct InitArgs {
     /// Keep the demo crates (complex, polynomials, etc.) instead of stripping them
     #[arg(long)]
     pub demo: bool,
+
+    /// Overwrite existing files that collide with template files
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn run(args: InitArgs) -> Result<()> {
@@ -60,7 +65,13 @@ pub fn run(args: InitArgs) -> Result<()> {
         style(dest.display()).bold()
     );
 
-    template::clone_template(dest, args.template.as_deref())?;
+    let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
+    let clone_path = template::template_clone_path(temp_dir.path());
+
+    let collisions = collision::detect_collisions(&clone_path, dest);
+    let on_collision = collision::resolve_collisions(&collisions, args.force, args.yes)?;
+
+    template::copy_template_to_dest(temp_dir.path(), dest, on_collision)?;
 
     eprintln!("  Applying project name...");
     template::templatize(dest, &name)?;

@@ -30,6 +30,10 @@ pub struct InitArgs {
     /// Overwrite existing files that collide with template files
     #[arg(long, short = 'f')]
     pub force: bool,
+
+    /// Skip generating example crates and skeleton binding examples
+    #[arg(long)]
+    pub no_examples: bool,
 }
 
 pub fn run(args: InitArgs) -> Result<()> {
@@ -73,13 +77,24 @@ pub fn run(args: InitArgs) -> Result<()> {
     let on_collision = collision::resolve_collisions(&collisions, args.force, args.yes)?;
 
     template::copy_template_to_dest(temp_dir.path(), dest, on_collision)?;
+    template::merge_gitignore(&clone_path, dest)?;
 
     eprintln!("  Applying project name...");
     template::templatize(dest, &name)?;
 
+    let no_examples = if args.no_examples && !args.yes && std::io::stdin().is_terminal() {
+        let proceed = dialoguer::Confirm::new()
+            .with_prompt("Skip example crates? The examples/ directory, `ffi test`, and test-* Make targets will not work until you modify them manually")
+            .default(true)
+            .interact()?;
+        proceed
+    } else {
+        args.no_examples
+    };
+
     if !args.demo {
         eprintln!("  Stripping demo crates...");
-        template::strip_example_crates(dest, &name)?;
+        template::strip_example_crates(dest, &name, no_examples)?;
     }
 
     if !dest.join(".git").exists() {

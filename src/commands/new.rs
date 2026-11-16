@@ -19,6 +19,10 @@ pub struct NewArgs {
     /// Keep the demo crates (complex, polynomials, etc.) instead of stripping them
     #[arg(long)]
     pub demo: bool,
+
+    /// Skip generating example crates and skeleton binding examples
+    #[arg(long)]
+    pub no_examples: bool,
 }
 
 pub fn run(args: NewArgs) -> Result<()> {
@@ -50,7 +54,7 @@ pub fn run(args: NewArgs) -> Result<()> {
 
     if !args.demo {
         eprintln!("  Stripping demo crates...");
-        template::strip_example_crates(&args.path, &name)?;
+        template::strip_example_crates(&args.path, &name, args.no_examples)?;
     }
 
     eprintln!("  Initializing git repository...");

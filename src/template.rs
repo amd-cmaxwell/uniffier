@@ -56,6 +56,10 @@ fn copy_dir_contents(src: &Path, dest: &Path, on_collision: OnCollision) -> Resu
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
+        if entry.file_name() == ".gitignore" {
+            continue;
+        }
+
         if dest_path.exists() && on_collision == OnCollision::Skip {
             continue;
         }
@@ -66,6 +70,55 @@ fn copy_dir_contents(src: &Path, dest: &Path, on_collision: OnCollision) -> Resu
             fs::copy(&src_path, &dest_path)?;
         }
     }
+    Ok(())
+}
+
+pub fn merge_gitignore(template_dir: &Path, project_dir: &Path) -> Result<()> {
+    let src = template_dir.join(".gitignore");
+    if !src.exists() {
+        return Ok(());
+    }
+
+    let template_content = fs::read_to_string(&src).context("failed to read template .gitignore")?;
+
+    let dest = project_dir.join(".gitignore");
+    if dest.exists() {
+        let existing = fs::read_to_string(&dest).context("failed to read existing .gitignore")?;
+        let existing_set: std::collections::BTreeSet<&str> = existing
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+
+        let mut new_lines = Vec::new();
+        for line in template_content.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                new_lines.push(line);
+            } else if !existing_set.contains(line) {
+                new_lines.push(line);
+            }
+        }
+
+        let new_lines: Vec<&str> = new_lines
+            .into_iter()
+            .skip_while(|l| l.is_empty() || l.starts_with('#'))
+            .collect();
+
+        if new_lines.iter().any(|l| !l.is_empty() && !l.starts_with('#')) {
+            let mut content = existing;
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str("\n# Added by ffi\n# ==============\n");
+            for line in &new_lines {
+                content.push_str(line);
+                content.push('\n');
+            }
+            fs::write(&dest, content).context("failed to write .gitignore")?;
+        }
+    } else {
+        fs::copy(&src, &dest).context("failed to copy .gitignore")?;
+    }
+
     Ok(())
 }
 
@@ -141,30 +194,13 @@ pub fn templatize(project_dir: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn strip_example_crates(project_dir: &Path, project_name: &str) -> Result<()> {
-    let keep_ffi = [
-        format!("{project_name}-ffi"),
-        "types".to_string(),
-        "tools".to_string(),
-        project_name.replace('-', "_"),
-        project_name.to_string(),
-    ];
-
-    let project_name_underscore = project_name.replace('-', "_");
-    let keep_lib = [
-        project_name.to_string(),
-        project_name_underscore,
-    ];
-
-    let mut removed = Vec::new();
-
+pub fn strip_example_crates(project_dir: &Path, project_name: &str, no_examples: bool) -> Result<()> {
     let ffi_dir = project_dir.join("crates/ffi");
     if ffi_dir.is_dir() {
         for entry in fs::read_dir(&ffi_dir)? {
             let entry = entry?;
             let name_str = entry.file_name().to_string_lossy().to_string();
-            if entry.path().is_dir() && !keep_ffi.iter().any(|k| k == &name_str) {
-                removed.push(name_str.clone());
+            if entry.path().is_dir() && name_str != "tools" {
                 fs::remove_dir_all(entry.path())
                     .with_context(|| format!("failed to remove crates/ffi/{name_str}"))?;
             }
@@ -176,17 +212,167 @@ pub fn strip_example_crates(project_dir: &Path, project_name: &str) -> Result<()
         for entry in fs::read_dir(&lib_dir)? {
             let entry = entry?;
             let name_str = entry.file_name().to_string_lossy().to_string();
-            if entry.path().is_dir() && !keep_lib.iter().any(|k| k == &name_str) {
-                removed.push(name_str.clone());
+            if entry.path().is_dir() {
                 fs::remove_dir_all(entry.path())
                     .with_context(|| format!("failed to remove crates/lib/{name_str}"))?;
             }
         }
     }
 
-    rewrite_workspace_toml(project_dir, &removed)?;
-    write_skeleton_examples(project_dir, project_name)?;
+    if !no_examples {
+        generate_example_foo_lib(project_dir)?;
+        generate_example_foo_ffi(project_dir)?;
+        generate_example_types_ffi(project_dir)?;
+    }
+
+    rewrite_workspace_toml_for_examples(project_dir, no_examples)?;
+
+    if !no_examples {
+        write_skeleton_examples(project_dir, project_name)?;
+    }
+
     strip_docs(project_dir)?;
+
+    Ok(())
+}
+
+fn generate_example_foo_lib(project_dir: &Path) -> Result<()> {
+    let crate_dir = project_dir.join("crates/lib/example-foo");
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\n\
+         name = \"example-foo\"\n\
+         version = \"0.1.0\"\n\
+         edition.workspace = true\n",
+    ).context("failed to write example-foo Cargo.toml")?;
+
+    fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn foo(a: &str, b: &str) -> String {\n\
+         \x20   format!(\"{a}{b}\")\n\
+         }\n\n\
+         pub fn bar(x: i32) -> i32 {\n\
+         \x20   x * 2\n\
+         }\n",
+    ).context("failed to write example-foo lib.rs")?;
+
+    Ok(())
+}
+
+fn generate_example_foo_ffi(project_dir: &Path) -> Result<()> {
+    let crate_dir = project_dir.join("crates/ffi/example-foo");
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\n\
+         name = \"example-foo-ffi\"\n\
+         version = \"0.1.0\"\n\
+         edition.workspace = true\n\n\
+         [lib]\n\
+         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\n\
+         [dependencies]\n\
+         example-foo.workspace = true\n\
+         uniffi.workspace = true\n",
+    ).context("failed to write example-foo-ffi Cargo.toml")?;
+
+    fs::write(
+        src_dir.join("lib.rs"),
+        "use uniffi;\n\n\
+         #[uniffi::export]\n\
+         pub fn foo(a: &str, b: &str) -> String {\n\
+         \x20   example_foo::foo(a, b)\n\
+         }\n\n\
+         #[uniffi::export]\n\
+         pub fn bar(x: i32) -> i32 {\n\
+         \x20   example_foo::bar(x)\n\
+         }\n",
+    ).context("failed to write example-foo-ffi lib.rs")?;
+
+    Ok(())
+}
+
+fn generate_example_types_ffi(project_dir: &Path) -> Result<()> {
+    let crate_dir = project_dir.join("crates/ffi/example-types");
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\n\
+         name = \"example-types-ffi\"\n\
+         version = \"0.1.0\"\n\
+         edition.workspace = true\n\n\
+         [lib]\n\
+         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\n\
+         [dependencies]\n\
+         uniffi.workspace = true\n",
+    ).context("failed to write example-types-ffi Cargo.toml")?;
+
+    fs::write(
+        src_dir.join("lib.rs"),
+        "use uniffi;\n",
+    ).context("failed to write example-types-ffi lib.rs")?;
+
+    Ok(())
+}
+
+fn rewrite_workspace_toml_for_examples(project_dir: &Path, no_examples: bool) -> Result<()> {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml_path).context("failed to read Cargo.toml")?;
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse Cargo.toml")?;
+
+    if let Some(deps) = doc
+        .get_mut("workspace")
+        .and_then(|w| w.get_mut("dependencies"))
+        .and_then(|d| d.as_table_like_mut())
+    {
+        let keys_to_remove: Vec<String> = deps
+            .iter()
+            .filter_map(|(k, _)| {
+                let key = k.to_string();
+                if key == "uniffi" || key == "uniffi-runtime-wasm" {
+                    None
+                } else {
+                    Some(key)
+                }
+            })
+            .collect();
+
+        for key in keys_to_remove {
+            deps.remove(&key);
+        }
+
+        if !no_examples {
+            deps.insert("example-foo", toml_edit::Item::Value(
+                toml_edit::InlineTable::from_iter([
+                    ("path", toml_edit::Value::from("crates/lib/example-foo")),
+                    ("version", toml_edit::Value::from("0.1.0")),
+                ]).into(),
+            ));
+            deps.insert("example-foo-ffi", toml_edit::Item::Value(
+                toml_edit::InlineTable::from_iter([
+                    ("path", toml_edit::Value::from("crates/ffi/example-foo")),
+                    ("version", toml_edit::Value::from("0.1.0")),
+                ]).into(),
+            ));
+            deps.insert("example-types-ffi", toml_edit::Item::Value(
+                toml_edit::InlineTable::from_iter([
+                    ("path", toml_edit::Value::from("crates/ffi/example-types")),
+                    ("version", toml_edit::Value::from("0.1.0")),
+                ]).into(),
+            ));
+        }
+    }
+
+    fs::write(&cargo_toml_path, doc.to_string()).context("failed to write Cargo.toml")?;
 
     Ok(())
 }
@@ -240,169 +426,187 @@ fn find_import(content: &str, marker: &str) -> Option<String> {
 }
 
 fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()> {
-    let name_u = project_name.replace('-', "_");
-    let core_mod = format!("{name_u}_core_ffi");
-    let types_mod = format!("{name_u}_types_ffi");
+    let ffi_mod = "example_foo_ffi";
+    let types_mod = "example_types_ffi";
 
     let py_demo_dir = project_dir.join("examples/py-demo");
     if py_demo_dir.exists() {
-        let py_demo_path = py_demo_dir.join("py_demo.py");
-        let content = format!(
-            "from {core_mod} import add\n\n\n\
-             def main():\n\
-             \x20   result = add(2, 3)\n\
-             \x20   assert result == 5, f\"expected 5, got {{result}}\"\n\
-             \x20   print(f\"add(2, 3) = {{result}}\")\n\
-             \x20   print(\"\\nAll tests passed!\")\n"
-        );
-        fs::write(&py_demo_path, content)
-            .context("failed to write py_demo.py skeleton")?;
+        fs::write(
+            py_demo_dir.join("py_demo.py"),
+            format!(
+                "from {ffi_mod} import foo, bar\n\n\n\
+                 def main():\n\
+                 \x20   result = foo(\"hello\", \"world\")\n\
+                 \x20   assert result == \"helloworld\", f\"expected 'helloworld', got '{{result}}'\"\n\
+                 \x20   print(f\"foo('hello', 'world') = '{{result}}'\")\n\n\
+                 \x20   doubled = bar(21)\n\
+                 \x20   assert doubled == 42, f\"expected 42, got {{doubled}}\"\n\
+                 \x20   print(f\"bar(21) = {{doubled}}\")\n\n\
+                 \x20   print(\"\\nAll tests passed!\")\n"
+            ),
+        ).context("failed to write py_demo.py skeleton")?;
 
-        let main_path = py_demo_dir.join("__main__.py");
-        fs::write(&main_path, "from py_demo import main\n\nmain()\n")
-            .context("failed to write __main__.py skeleton")?;
+        fs::write(
+            py_demo_dir.join("__main__.py"),
+            "from py_demo import main\n\nmain()\n",
+        ).context("failed to write __main__.py skeleton")?;
 
-        let pyproject_path = py_demo_dir.join("pyproject.toml");
         let pkg_name = project_name;
-        let content = format!(
-            "[project]\n\
-             name = \"{pkg_name}\"\n\
-             version = \"0.1.0\"\n\
-             requires-python = \">=3.9\"\n\n\
-             [project.scripts]\n\
-             {pkg_name} = \"py_demo:main\"\n\n\
-             [build-system]\n\
-             requires = [\"hatchling\"]\n\
-             build-backend = \"hatchling.build\"\n\n\
-             [tool.hatch.build.targets.wheel]\n\
-             packages = [\"py_demo.py\"]\n"
-        );
-        fs::write(&pyproject_path, content)
-            .context("failed to write pyproject.toml skeleton")?;
+        fs::write(
+            py_demo_dir.join("pyproject.toml"),
+            format!(
+                "[project]\n\
+                 name = \"{pkg_name}\"\n\
+                 version = \"0.1.0\"\n\
+                 requires-python = \">=3.9\"\n\n\
+                 [project.scripts]\n\
+                 {pkg_name} = \"py_demo:main\"\n\n\
+                 [build-system]\n\
+                 requires = [\"hatchling\"]\n\
+                 build-backend = \"hatchling.build\"\n\n\
+                 [tool.hatch.build.targets.wheel]\n\
+                 packages = [\"py_demo.py\"]\n"
+            ),
+        ).context("failed to write pyproject.toml skeleton")?;
     }
 
     let go_path = project_dir.join("examples/go-demo/main.go");
     if go_path.exists() {
         let existing = fs::read_to_string(&go_path)?;
-        if let Some(core_import) = find_import(&existing, &format!("{core_mod}\"")) {
-            let content = format!(
-                "package main\n\n\
-                 import (\n\
-                 \t\"fmt\"\n\n\
-                 \tcore_ffi \"{core_import}\"\n\
-                 )\n\n\
-                 func main() {{\n\
-                 \tfmt.Printf(\"add(2, 3) = %d\\n\", core_ffi.Add(2, 3))\n\
-                 \tfmt.Println(\"\\nAll tests passed!\")\n\
-                 }}\n"
-            );
-            fs::write(&go_path, content)
-                .context("failed to write Go skeleton")?;
+        if let Some(base_import) = find_import(&existing, "ffi\"") {
+            let base = base_import.rsplit('/').skip(1).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+            let foo_import = format!("{base}/{ffi_mod}");
+            fs::write(
+                &go_path,
+                format!(
+                    "package main\n\n\
+                     import (\n\
+                     \t\"fmt\"\n\n\
+                     \tfoo_ffi \"{foo_import}\"\n\
+                     )\n\n\
+                     func main() {{\n\
+                     \tfmt.Printf(\"foo('hello', 'world') = '%s'\\n\", foo_ffi.Foo(\"hello\", \"world\"))\n\
+                     \tfmt.Printf(\"bar(21) = %d\\n\", foo_ffi.Bar(21))\n\
+                     \tfmt.Println(\"\\nAll tests passed!\")\n\
+                     }}\n"
+                ),
+            ).context("failed to write Go skeleton")?;
         }
     }
 
     let js_path = project_dir.join("examples/js-demo/main.mjs");
     if js_path.exists() {
         let existing = fs::read_to_string(&js_path)?;
-        let core_pkg = find_import(&existing, "core-ffi");
-        let types_pkg = find_import(&existing, "types-ffi");
-        if let (Some(core_pkg), Some(types_pkg)) = (core_pkg, types_pkg) {
-            let content = format!(
-                "import {{ describe, it, before }} from \"node:test\";\n\
-                 import assert from \"node:assert/strict\";\n\
-                 import {{ createRequire }} from \"node:module\";\n\
-                 import {{ pathToFileURL }} from \"node:url\";\n\n\
-                 import {{ uniffiInitAsync as initTypes }} from \"{types_pkg}\";\n\
-                 import {{ uniffiInitAsync as initCore, add }} from \"{core_pkg}\";\n\n\
-                 const require = createRequire(import.meta.url);\n\
-                 const wasmUrl = (pkg, name) =>\n\
-                 \x20 pathToFileURL(require.resolve(`${{pkg}}/src/${{name}}.wasm`));\n\n\
-                 before(async () => {{\n\
-                 \x20 await Promise.all([\n\
-                 \x20   initTypes(wasmUrl(\"{types_pkg}\", \"{types_mod}\")),\n\
-                 \x20   initCore(wasmUrl(\"{core_pkg}\", \"{core_mod}\")),\n\
-                 \x20 ]);\n\
-                 }});\n\n\
-                 describe(\"core\", () => {{\n\
-                 \x20 it(\"adds two numbers\", () => {{\n\
-                 \x20   assert.equal(add(2, 3), 5);\n\
-                 \x20 }});\n\
-                 }});\n"
-            );
-            fs::write(&js_path, content)
-                .context("failed to write JS skeleton")?;
+        if let Some(scope) = find_npm_scope(&existing) {
+            let foo_pkg = format!("{scope}example-foo-ffi");
+            let types_pkg = format!("{scope}example-types-ffi");
+            fs::write(
+                &js_path,
+                format!(
+                    "import {{ describe, it, before }} from \"node:test\";\n\
+                     import assert from \"node:assert/strict\";\n\
+                     import {{ createRequire }} from \"node:module\";\n\
+                     import {{ pathToFileURL }} from \"node:url\";\n\n\
+                     import {{ uniffiInitAsync as initTypes }} from \"{types_pkg}\";\n\
+                     import {{ uniffiInitAsync as initFoo, foo, bar }} from \"{foo_pkg}\";\n\n\
+                     const require = createRequire(import.meta.url);\n\
+                     const wasmUrl = (pkg, name) =>\n\
+                     \x20 pathToFileURL(require.resolve(`${{pkg}}/src/${{name}}.wasm`));\n\n\
+                     before(async () => {{\n\
+                     \x20 await Promise.all([\n\
+                     \x20   initTypes(wasmUrl(\"{types_pkg}\", \"{types_mod}\")),\n\
+                     \x20   initFoo(wasmUrl(\"{foo_pkg}\", \"{ffi_mod}\")),\n\
+                     \x20 ]);\n\
+                     }});\n\n\
+                     describe(\"example-foo\", () => {{\n\
+                     \x20 it(\"concatenates strings\", () => {{\n\
+                     \x20   assert.equal(foo(\"hello\", \"world\"), \"helloworld\");\n\
+                     \x20 }});\n\n\
+                     \x20 it(\"doubles a number\", () => {{\n\
+                     \x20   assert.equal(bar(21), 42);\n\
+                     \x20 }});\n\
+                     }});\n"
+                ),
+            ).context("failed to write JS skeleton")?;
         }
     }
 
     let web_ts_path = project_dir.join("examples/web-demo/main.ts");
     if web_ts_path.exists() {
         let existing = fs::read_to_string(&web_ts_path)?;
-        let core_pkg = find_import(&existing, "core-ffi");
-        let types_pkg = find_import(&existing, "types-ffi");
-        if let (Some(core_pkg), Some(types_pkg)) = (core_pkg, types_pkg) {
-            let content = format!(
-                "import {{\n\
-                 \x20 uniffiInitAsync as initTypes,\n\
-                 }} from \"{types_pkg}\";\n\
-                 import {{\n\
-                 \x20 uniffiInitAsync as initCore,\n\
-                 \x20 add,\n\
-                 }} from \"{core_pkg}\";\n\n\
-                 async function main() {{\n\
-                 \x20 const loading = document.getElementById(\"loading\")!;\n\
-                 \x20 const appEl = document.getElementById(\"app\")!;\n\n\
-                 \x20 try {{\n\
-                 \x20   await Promise.all([\n\
-                 \x20     initTypes(fetch(new URL(\n\
-                 \x20       `./node_modules/{types_pkg}/src/{types_mod}.wasm`, import.meta.url))),\n\
-                 \x20     initCore(fetch(new URL(\n\
-                 \x20       `./node_modules/{core_pkg}/src/{core_mod}.wasm`, import.meta.url))),\n\
-                 \x20   ]);\n\
-                 \x20 }} catch (e: any) {{\n\
-                 \x20   loading.textContent = `Failed to load WASM: ${{e.message || e}}`;\n\
-                 \x20   loading.style.color = \"red\";\n\
-                 \x20   return;\n\
-                 \x20 }}\n\n\
-                 \x20 loading.style.display = \"none\";\n\
-                 \x20 appEl.style.display = \"block\";\n\n\
-                 \x20 const result = add(2, 3);\n\
-                 \x20 appEl.innerHTML = `<h2>Core Arithmetic</h2>\n\
-                 \x20   <p>add(2, 3) = ${{result}}</p>\n\
-                 \x20   <p>${{result === 5 ? \"Test passed!\" : \"Test FAILED!\"}}</p>`;\n\
-                 }}\n\n\
-                 main();\n"
-            );
-            fs::write(&web_ts_path, content)
-                .context("failed to write web demo skeleton")?;
+        if let Some(scope) = find_npm_scope(&existing) {
+            let foo_pkg = format!("{scope}example-foo-ffi");
+            let types_pkg = format!("{scope}example-types-ffi");
+            fs::write(
+                &web_ts_path,
+                format!(
+                    "import {{\n\
+                     \x20 uniffiInitAsync as initTypes,\n\
+                     }} from \"{types_pkg}\";\n\
+                     import {{\n\
+                     \x20 uniffiInitAsync as initFoo,\n\
+                     \x20 foo,\n\
+                     \x20 bar,\n\
+                     }} from \"{foo_pkg}\";\n\n\
+                     async function main() {{\n\
+                     \x20 const loading = document.getElementById(\"loading\")!;\n\
+                     \x20 const appEl = document.getElementById(\"app\")!;\n\n\
+                     \x20 try {{\n\
+                     \x20   await Promise.all([\n\
+                     \x20     initTypes(fetch(new URL(\n\
+                     \x20       `./node_modules/{types_pkg}/src/{types_mod}.wasm`, import.meta.url))),\n\
+                     \x20     initFoo(fetch(new URL(\n\
+                     \x20       `./node_modules/{foo_pkg}/src/{ffi_mod}.wasm`, import.meta.url))),\n\
+                     \x20   ]);\n\
+                     \x20 }} catch (e: any) {{\n\
+                     \x20   loading.textContent = `Failed to load WASM: ${{e.message || e}}`;\n\
+                     \x20   loading.style.color = \"red\";\n\
+                     \x20   return;\n\
+                     \x20 }}\n\n\
+                     \x20 loading.style.display = \"none\";\n\
+                     \x20 appEl.style.display = \"block\";\n\n\
+                     \x20 const result = foo(\"hello\", \"world\");\n\
+                     \x20 const doubled = bar(21);\n\
+                     \x20 appEl.innerHTML = `<h2>Example FFI</h2>\n\
+                     \x20   <p>foo('hello', 'world') = '${{result}}'</p>\n\
+                     \x20   <p>bar(21) = ${{doubled}}</p>\n\
+                     \x20   <p>${{result === \"helloworld\" && doubled === 42 ? \"All tests passed!\" : \"Tests FAILED!\"}}</p>`;\n\
+                     }}\n\n\
+                     main();\n"
+                ),
+            ).context("failed to write web demo skeleton")?;
         }
     }
 
     let vite_config_path = project_dir.join("examples/web-demo/vite.config.ts");
     if vite_config_path.exists() {
         let existing = fs::read_to_string(&vite_config_path)?;
-        let core_pkg = find_import(&existing, "core-ffi");
-        let types_pkg = find_import(&existing, "types-ffi");
-        if let (Some(core_pkg), Some(types_pkg)) = (core_pkg, types_pkg) {
-            let content = format!(
-                "import {{ defineConfig }} from \"vite\";\n\n\
-                 export default defineConfig({{\n\
-                 \x20 assetsInclude: [\"**/*.wasm\"],\n\
-                 \x20 optimizeDeps: {{\n\
-                 \x20   exclude: [\n\
-                 \x20     \"{types_pkg}\",\n\
-                 \x20     \"{core_pkg}\",\n\
-                 \x20   ],\n\
-                 \x20 }},\n\
-                 }});\n"
-            );
-            fs::write(&vite_config_path, content)
-                .context("failed to write vite.config.ts skeleton")?;
+        if let Some(scope) = find_npm_scope(&existing) {
+            let foo_pkg = format!("{scope}example-foo-ffi");
+            let types_pkg = format!("{scope}example-types-ffi");
+            fs::write(
+                &vite_config_path,
+                format!(
+                    "import {{ defineConfig }} from \"vite\";\n\n\
+                     export default defineConfig({{\n\
+                     \x20 assetsInclude: [\"**/*.wasm\"],\n\
+                     \x20 optimizeDeps: {{\n\
+                     \x20   exclude: [\n\
+                     \x20     \"{types_pkg}\",\n\
+                     \x20     \"{foo_pkg}\",\n\
+                     \x20   ],\n\
+                     \x20 }},\n\
+                     }});\n"
+                ),
+            ).context("failed to write vite.config.ts skeleton")?;
         }
     }
 
     let index_path = project_dir.join("examples/web-demo/index.html");
     if index_path.exists() {
-        let content = "<!DOCTYPE html>\n\
+        fs::write(
+            &index_path,
+            "<!DOCTYPE html>\n\
              <html lang=\"en\">\n\
              \x20 <head>\n\
              \x20   <meta charset=\"UTF-8\" />\n\
@@ -420,47 +624,20 @@ fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()>
              \x20   <div id=\"app\"></div>\n\
              \x20   <script type=\"module\" src=\"/main.ts\"></script>\n\
              \x20 </body>\n\
-             </html>\n";
-        fs::write(&index_path, content)
-            .context("failed to write index.html skeleton")?;
+             </html>\n",
+        ).context("failed to write index.html skeleton")?;
     }
 
     Ok(())
 }
 
-fn rewrite_workspace_toml(project_dir: &Path, removed_crates: &[String]) -> Result<()> {
-    let cargo_toml_path = project_dir.join("Cargo.toml");
-    let content = fs::read_to_string(&cargo_toml_path).context("failed to read Cargo.toml")?;
-
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .context("failed to parse Cargo.toml")?;
-
-    if let Some(deps) = doc
-        .get_mut("workspace")
-        .and_then(|w| w.get_mut("dependencies"))
-        .and_then(|d| d.as_table_like_mut())
-    {
-        let keys_to_remove: Vec<String> = deps
-            .iter()
-            .filter_map(|(k, _)| {
-                let key = k.to_string();
-                if removed_crates.iter().any(|name| key.contains(name.as_str())) {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for key in keys_to_remove {
-            deps.remove(&key);
-        }
-    }
-
-    fs::write(&cargo_toml_path, doc.to_string()).context("failed to write Cargo.toml")?;
-
-    Ok(())
+fn find_npm_scope(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let idx = line.find('@')?;
+        let rest = &line[idx..];
+        let slash = rest.find('/')?;
+        Some(rest[..slash + 1].to_string())
+    })
 }
 
 pub fn stamp_example_imports(project_dir: &Path, repo_owner: &str, repo_name: &str) -> Result<()> {

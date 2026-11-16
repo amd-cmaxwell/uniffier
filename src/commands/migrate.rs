@@ -40,6 +40,10 @@ pub struct MigrateArgs {
     #[arg(long, value_delimiter = ',', conflicts_with = "ffi_crates")]
     pub skip_ffi: Vec<String>,
 
+    /// Skip generating example crates and skeleton binding examples
+    #[arg(long)]
+    pub no_examples: bool,
+
     /// Project directory (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: PathBuf,
@@ -94,7 +98,7 @@ fn resolve_ffi_selection(
         }
         selected
     } else if !args.skip_ffi.is_empty() {
-        let mut skip_set = std::collections::HashSet::new();
+        let mut skip_set = std::collections::BTreeSet::new();
         for name in &args.skip_ffi {
             match crate_names.iter().position(|n| n == name) {
                 Some(i) => { skip_set.insert(i); }
@@ -300,7 +304,7 @@ fn migrate_workspace(
 
     let ffi_indices = resolve_ffi_selection(&crate_names, args, "Select crates to add FFI wrappers for")?;
 
-    let ffi_set: std::collections::HashSet<usize> = ffi_indices.into_iter().collect();
+    let ffi_set: std::collections::BTreeSet<usize> = ffi_indices.into_iter().collect();
 
     if !args.yes && std::io::stdin().is_terminal() {
         let ffi_names: Vec<&str> = ffi_set.iter().map(|&i| existing_crates[i].name.as_str()).collect();
@@ -346,7 +350,12 @@ fn migrate_workspace(
             let dest = project_dir.join(dest_prefix).join(&dc.name);
             let src = project_dir.join(&dc.rel_path);
 
-            if src != dest {
+            if dc.rel_path == "." {
+                eprintln!("  Moving root crate '{}' into {}/{}...", dc.name, dest_prefix, dc.name);
+                fs::create_dir_all(dest.join("src"))?;
+                move_crate_contents(project_dir, &dest)?;
+                rewrite_crate_toml_for_workspace(&dest)?;
+            } else if src != dest {
                 eprintln!("  Moving '{}' into {}/{}...", dc.rel_path, dest_prefix, dc.name);
                 fs::create_dir_all(dest.parent().unwrap())?;
                 fs::rename(&src, &dest)
@@ -439,7 +448,7 @@ fn migrate_loose_crates(
 
     let ffi_indices = resolve_ffi_selection(&crate_names, args, "Select crates to add FFI wrappers for")?;
 
-    let ffi_set: std::collections::HashSet<usize> = ffi_indices.into_iter().collect();
+    let ffi_set: std::collections::BTreeSet<usize> = ffi_indices.into_iter().collect();
 
     let ffi_names: Vec<String> = ffi_set.iter().map(|&i| crate_names[i].clone()).collect();
     let non_ffi_names: Vec<String> = (0..all_crates.len())
@@ -554,8 +563,10 @@ fn migrate_loose_crates(
         }
     }
 
-    eprintln!("  Creating shared FFI types crate...");
-    create_ffi_types_crate(project_dir)?;
+    if !args.no_examples {
+        eprintln!("  Creating shared FFI types crate...");
+        create_ffi_types_crate(project_dir)?;
+    }
 
     eprintln!("  Copying template assets...");
     clone_template_assets(project_dir, args)?;
@@ -666,7 +677,7 @@ fn read_crate_name_version(toml_path: &Path, fallback_name: &str) -> (String, St
 }
 
 fn discover_demo_crates(template_ffi_dir: &Path) -> Vec<String> {
-    let skip = ["tools", "types"];
+    let skip = ["tools"];
     let mut crates = Vec::new();
     if let Ok(entries) = fs::read_dir(template_ffi_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -760,6 +771,8 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
             }
         }
     }
+
+    template::merge_gitignore(&temp_path, project_dir)?;
 
     let tools_src = temp_path.join("crates/ffi/tools");
     let tools_dest = project_dir.join("crates/ffi/tools");

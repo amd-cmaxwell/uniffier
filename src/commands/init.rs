@@ -82,20 +82,35 @@ pub fn run(args: InitArgs) -> Result<()> {
     eprintln!("  Applying project name...");
     template::templatize(dest, &name)?;
 
-    let no_examples = if args.no_examples && !args.yes && std::io::stdin().is_terminal() {
-        let proceed = dialoguer::Confirm::new()
-            .with_prompt("Skip example crates? The examples/ directory, `ffi test`, and test-* Make targets will not work until you modify them manually")
-            .default(true)
-            .interact()?;
-        proceed
-    } else {
-        args.no_examples
-    };
+    if args.no_examples && !args.demo {
+        if !args.yes && std::io::stdin().is_terminal() {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+            let proceed = dialoguer::Confirm::new()
+                .with_prompt("Continue without examples?")
+                .default(false)
+                .interact()?;
+            if !proceed {
+                bail!("aborted");
+            }
+        } else {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+        }
+    }
 
     if !args.demo {
         eprintln!("  Stripping demo crates...");
-        template::strip_example_crates(dest, &name, no_examples)?;
+        template::strip_example_crates(dest, &name, args.no_examples)?;
     }
+
+    template::write_project_readme(dest, true)?;
 
     if !dest.join(".git").exists() {
         eprintln!("  Initializing git repository...");

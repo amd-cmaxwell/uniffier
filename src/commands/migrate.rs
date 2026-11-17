@@ -50,6 +50,29 @@ pub struct MigrateArgs {
 }
 
 pub fn run(args: MigrateArgs) -> Result<()> {
+    if args.no_examples && !args.demo {
+        if !args.yes && std::io::stdin().is_terminal() {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+            let proceed = dialoguer::Confirm::new()
+                .with_prompt("Continue without examples?")
+                .default(false)
+                .interact()?;
+            if !proceed {
+                bail!("aborted");
+            }
+        } else {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+        }
+    }
+
     let project_dir = args.path.canonicalize().unwrap_or(args.path.clone());
 
     if project_dir.join("crates/ffi").exists() {
@@ -73,6 +96,29 @@ pub fn run(args: MigrateArgs) -> Result<()> {
             migrate_loose_crates(&project_dir, root_crate, sub_crates, &args)?;
         }
     }
+
+    template::write_project_readme(&project_dir, false)?;
+
+    Ok(())
+}
+
+fn generate_examples(project_dir: &Path, project_name: &str) -> Result<()> {
+    eprintln!("  Generating example crates...");
+    template::generate_example_foo_lib(project_dir)?;
+    template::generate_example_foo_ffi(project_dir)?;
+    template::generate_example_types_ffi(project_dir)?;
+
+    eprintln!("  Writing skeleton binding examples...");
+    template::write_skeleton_examples(project_dir, project_name)?;
+
+    eprintln!("  Adding example dependencies to workspace...");
+    template::add_example_workspace_deps(project_dir)?;
+
+    eprintln!("  Registering example types in uniffi.toml...");
+    template::add_uniffi_external_packages(
+        project_dir,
+        &[("example_types_ffi", "example_types_ffi")],
+    )?;
 
     Ok(())
 }
@@ -156,9 +202,6 @@ fn migrate_single_crate(
         eprintln!("  Creating FFI wrapper crate...");
         create_ffi_crate(project_dir, crate_name, "../..")?;
 
-        eprintln!("  Creating shared FFI types crate...");
-        create_ffi_types_crate(project_dir)?;
-
         eprintln!("  Copying template assets (Makefile, scripts, templates, tools)...");
         clone_template_assets(project_dir, args)?;
 
@@ -180,6 +223,8 @@ fn migrate_single_crate(
 
         fs::write(&original_toml_path, doc.to_string())?;
     } else {
+        let ws_pkg_fields = collect_workspace_pkg_fields(project_dir);
+
         let lib_dir = project_dir.join("crates/lib").join(crate_name);
         fs::create_dir_all(lib_dir.join("src"))
             .context("failed to create crates/lib/ directory")?;
@@ -188,16 +233,13 @@ fn migrate_single_crate(
         move_crate_contents(project_dir, &lib_dir)?;
 
         eprintln!("  Rewriting crate Cargo.toml for workspace...");
-        rewrite_crate_toml_for_workspace(&lib_dir)?;
+        rewrite_crate_toml_for_workspace(&lib_dir, &ws_pkg_fields)?;
 
         eprintln!("  Writing workspace Cargo.toml...");
         write_workspace_cargo_toml(project_dir, crate_name, crate_version)?;
 
         eprintln!("  Creating FFI wrapper crate...");
         create_ffi_crate(project_dir, crate_name, &format!("../../lib/{crate_name}"))?;
-
-        eprintln!("  Creating shared FFI types crate...");
-        create_ffi_types_crate(project_dir)?;
 
         eprintln!("  Copying template assets (Makefile, scripts, templates, tools)...");
         clone_template_assets(project_dir, args)?;
@@ -208,19 +250,21 @@ fn migrate_single_crate(
         template::templatize(project_dir, crate_name)?;
     }
 
+    if !args.no_examples && !args.demo {
+        generate_examples(project_dir, crate_name)?;
+    }
+
     eprintln!("{} Migration complete.", style("✓").green());
     eprintln!();
     if args.in_place {
         eprintln!("  Project structure:");
         eprintln!("    ./                        <- your original crate");
         eprintln!("    crates/ffi/{crate_name}/   <- UniFFI wrapper (edit this)");
-        eprintln!("    crates/ffi/types/          <- shared FFI types");
         eprintln!("    crates/ffi/tools/          <- bindgen tool binaries");
     } else {
         eprintln!("  Project structure:");
         eprintln!("    crates/lib/{crate_name}/   <- your original crate");
         eprintln!("    crates/ffi/{crate_name}/   <- UniFFI wrapper (edit this)");
-        eprintln!("    crates/ffi/types/          <- shared FFI types");
         eprintln!("    crates/ffi/tools/          <- bindgen tool binaries");
     }
     eprintln!();
@@ -256,14 +300,69 @@ fn move_crate_contents(project_dir: &Path, lib_dir: &Path) -> Result<()> {
     }
 
     let original_toml = project_dir.join("Cargo.toml");
+    let toml_content = fs::read_to_string(&original_toml)?;
+    if let Ok(doc) = toml_content.parse::<toml_edit::DocumentMut>() {
+        let readme_path = doc
+            .get("package")
+            .and_then(|p| p.get("readme"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("README.md");
+        let readme_src = project_dir.join(readme_path);
+        if readme_src.is_file() {
+            let readme_dest = lib_dir.join(readme_src.file_name().unwrap());
+            fs::rename(&readme_src, &readme_dest)
+                .with_context(|| format!("failed to move {}", readme_path))?;
+        }
+    }
+
     let dest_toml = lib_dir.join("Cargo.toml");
     fs::copy(&original_toml, &dest_toml).context("failed to copy Cargo.toml")?;
 
     Ok(())
 }
 
+/// Determine which fields will be present in `[workspace.package]` by reading the
+/// original Cargo.toml before any restructuring occurs.
+fn collect_workspace_pkg_fields(project_dir: &Path) -> std::collections::BTreeSet<String> {
+    let toml_path = project_dir.join("Cargo.toml");
+    let content = match fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+
+    if let Some(ws_pkg) = doc
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.as_table())
+    {
+        return ws_pkg.iter().map(|(k, _)| k.to_string()).collect();
+    }
+
+    if let Some(pkg) = doc.get("package").and_then(|p| p.as_table()) {
+        let candidate_fields = ["edition", "license", "repository", "rust-version",
+                                "authors", "description", "homepage"];
+        return candidate_fields
+            .iter()
+            .filter(|f| pkg.contains_key(**f))
+            .map(|f| f.to_string())
+            .collect();
+    }
+
+    let mut fields = std::collections::BTreeSet::new();
+    fields.insert("edition".to_string());
+    fields
+}
+
 /// Rewrite the moved crate's Cargo.toml to use workspace inheritance for common fields.
-fn rewrite_crate_toml_for_workspace(lib_dir: &Path) -> Result<()> {
+/// Only converts fields that actually exist in `[workspace.package]`.
+fn rewrite_crate_toml_for_workspace(
+    lib_dir: &Path,
+    workspace_pkg_fields: &std::collections::BTreeSet<String>,
+) -> Result<()> {
     let toml_path = lib_dir.join("Cargo.toml");
     let content = fs::read_to_string(&toml_path)?;
     let mut doc = content.parse::<toml_edit::DocumentMut>()?;
@@ -271,7 +370,7 @@ fn rewrite_crate_toml_for_workspace(lib_dir: &Path) -> Result<()> {
     if let Some(pkg) = doc.get_mut("package").and_then(|p| p.as_table_like_mut()) {
         let inherit_fields = ["edition", "license", "repository", "rust-version"];
         for field in &inherit_fields {
-            if pkg.contains_key(field) {
+            if pkg.contains_key(field) && workspace_pkg_fields.contains(*field) {
                 pkg.remove(field);
                 let mut inline = toml_edit::InlineTable::new();
                 inline.insert("workspace", toml_edit::Value::from(true));
@@ -279,6 +378,8 @@ fn rewrite_crate_toml_for_workspace(lib_dir: &Path) -> Result<()> {
             }
         }
     }
+
+    doc.remove("workspace");
 
     fs::write(&toml_path, doc.to_string())?;
     Ok(())
@@ -328,9 +429,6 @@ fn migrate_workspace(
             }
         }
 
-        eprintln!("  Creating shared FFI types crate...");
-        create_ffi_types_crate(project_dir)?;
-
         eprintln!("  Copying template assets...");
         clone_template_assets(project_dir, args)?;
 
@@ -338,11 +436,13 @@ fn migrate_workspace(
         eprintln!("  Updating workspace Cargo.toml...");
         add_ffi_to_workspace_toml(project_dir, &ffi_names)?;
     } else {
+        let ws_pkg_fields = collect_workspace_pkg_fields(project_dir);
+
         fs::create_dir_all(project_dir.join("crates/lib"))?;
         fs::create_dir_all(project_dir.join("crates"))?;
 
         let mut workspace_crates = Vec::new();
-        let mut has_non_lib_crates = false;
+        let mut non_ffi_paths = Vec::new();
 
         for (i, dc) in existing_crates.iter().enumerate() {
             let is_ffi = ffi_set.contains(&i);
@@ -354,33 +454,35 @@ fn migrate_workspace(
                 eprintln!("  Moving root crate '{}' into {}/{}...", dc.name, dest_prefix, dc.name);
                 fs::create_dir_all(dest.join("src"))?;
                 move_crate_contents(project_dir, &dest)?;
-                rewrite_crate_toml_for_workspace(&dest)?;
+                rewrite_crate_toml_for_workspace(&dest, &ws_pkg_fields)?;
             } else if src != dest {
                 eprintln!("  Moving '{}' into {}/{}...", dc.rel_path, dest_prefix, dc.name);
                 fs::create_dir_all(dest.parent().unwrap())?;
                 fs::rename(&src, &dest)
                     .with_context(|| format!("failed to move {}", dc.rel_path))?;
-                rewrite_crate_toml_for_workspace(&dest)?;
+                rewrite_crate_toml_for_workspace(&dest, &ws_pkg_fields)?;
+            }
+
+            let crate_path = format!("{dest_prefix}/{}", dc.name);
+            if !is_ffi {
+                non_ffi_paths.push(crate_path.clone());
             }
 
             workspace_crates.push(WorkspaceCrate {
                 name: dc.name.clone(),
                 version: dc.version.clone(),
-                path: format!("{dest_prefix}/{}", dc.name),
+                path: crate_path,
                 has_ffi: is_ffi,
             });
-
-            if !is_ffi {
-                has_non_lib_crates = true;
-            }
         }
 
         eprintln!("  Writing workspace Cargo.toml...");
-        let mut member_patterns = vec!["crates/lib/*"];
-        if has_non_lib_crates {
-            member_patterns.push("crates/*");
+        let mut member_patterns = vec!["crates/lib/*".to_string()];
+        for p in &non_ffi_paths {
+            member_patterns.push(p.clone());
         }
-        write_workspace_cargo_toml_multi(project_dir, &workspace_crates, &member_patterns)?;
+        let member_refs: Vec<&str> = member_patterns.iter().map(|s| s.as_str()).collect();
+        write_workspace_cargo_toml_multi(project_dir, &workspace_crates, &member_refs)?;
 
         for (i, dc) in existing_crates.iter().enumerate() {
             if ffi_set.contains(&i) {
@@ -389,21 +491,23 @@ fn migrate_workspace(
             }
         }
 
-        eprintln!("  Creating shared FFI types crate...");
-        create_ffi_types_crate(project_dir)?;
-
         eprintln!("  Copying template assets...");
         clone_template_assets(project_dir, args)?;
     }
 
+    let project_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+
     if args.demo {
-        let project_name = project_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string();
         eprintln!("  Applying project name to demo files...");
         template::templatize(project_dir, &project_name)?;
+    }
+
+    if !args.no_examples && !args.demo {
+        generate_examples(project_dir, &project_name)?;
     }
 
     eprintln!("{} Migration complete.", style("✓").green());
@@ -506,11 +610,13 @@ fn migrate_loose_crates(
         eprintln!("  Writing workspace Cargo.toml...");
         write_workspace_cargo_toml_multi(project_dir, &workspace_crates, &patterns_ref)?;
     } else {
+        let ws_pkg_fields = collect_workspace_pkg_fields(project_dir);
+
         fs::create_dir_all(project_dir.join("crates/lib"))?;
         fs::create_dir_all(project_dir.join("crates"))?;
 
         let mut workspace_crates = Vec::new();
-        let mut has_non_lib_crates = false;
+        let mut non_ffi_paths = Vec::new();
 
         for (i, crate_info) in all_crates.iter().enumerate() {
             let is_ffi = ffi_set.contains(&i);
@@ -534,26 +640,28 @@ fn migrate_loose_crates(
                     .with_context(|| format!("failed to move {}", crate_info.dir_name))?;
             }
 
-            rewrite_crate_toml_for_workspace(&dest)?;
+            rewrite_crate_toml_for_workspace(&dest, &ws_pkg_fields)?;
+
+            let crate_path = format!("{dest_prefix}/{}", crate_info.name);
+            if !is_ffi {
+                non_ffi_paths.push(crate_path.clone());
+            }
 
             workspace_crates.push(WorkspaceCrate {
                 name: crate_info.name.clone(),
                 version: crate_info.version.clone(),
-                path: format!("{dest_prefix}/{}", crate_info.name),
+                path: crate_path,
                 has_ffi: is_ffi,
             });
-
-            if !is_ffi {
-                has_non_lib_crates = true;
-            }
         }
 
         eprintln!("  Writing workspace Cargo.toml...");
-        let mut member_patterns = vec!["crates/lib/*"];
-        if has_non_lib_crates {
-            member_patterns.push("crates/*");
+        let mut member_patterns = vec!["crates/lib/*".to_string()];
+        for p in &non_ffi_paths {
+            member_patterns.push(p.clone());
         }
-        write_workspace_cargo_toml_multi(project_dir, &workspace_crates, &member_patterns)?;
+        let member_refs: Vec<&str> = member_patterns.iter().map(|s| s.as_str()).collect();
+        write_workspace_cargo_toml_multi(project_dir, &workspace_crates, &member_refs)?;
 
         for (i, crate_info) in all_crates.iter().enumerate() {
             if ffi_set.contains(&i) {
@@ -563,22 +671,22 @@ fn migrate_loose_crates(
         }
     }
 
-    if !args.no_examples {
-        eprintln!("  Creating shared FFI types crate...");
-        create_ffi_types_crate(project_dir)?;
-    }
-
     eprintln!("  Copying template assets...");
     clone_template_assets(project_dir, args)?;
 
+    let project_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+
     if args.demo {
-        let project_name = project_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("project")
-            .to_string();
         eprintln!("  Applying project name to demo files...");
         template::templatize(project_dir, &project_name)?;
+    }
+
+    if !args.no_examples && !args.demo {
+        generate_examples(project_dir, &project_name)?;
     }
 
     eprintln!("{} Migration complete.", style("✓").green());
@@ -597,7 +705,6 @@ fn migrate_loose_crates(
             eprintln!("    crates/{}/       <- lib crate", crate_info.name);
         }
     }
-    eprintln!("    crates/ffi/types/          <- shared FFI types");
     eprintln!("    crates/ffi/tools/          <- bindgen tool binaries");
     eprintln!();
     eprintln!("  Next steps:");
@@ -713,6 +820,7 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
 
     let extra_assets: &[(&str, &str)] = &[
         ("crates/ffi/tools", "crates/ffi/tools"),
+        ("crates/ffi/README.md", "crates/ffi/README.md"),
         ("uniffi.toml", "uniffi.toml"),
         ("bindings/README.md", "bindings/README.md"),
     ];
@@ -729,15 +837,25 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
         }
     }
 
+    let copy_examples = !args.no_examples;
+
+    if copy_examples {
+        let src = temp_path.join("examples");
+        if src.exists() {
+            let collisions = collision::detect_collisions(&src, &project_dir.join("examples"));
+            for rel in collisions {
+                all_collisions.push(PathBuf::from("examples").join(rel));
+            }
+        }
+    }
+
     let demo_crates = if args.demo {
         let crates = discover_demo_crates(&temp_path.join("crates/ffi"));
-        for dir in &["examples", "docs"] {
-            let src = temp_path.join(dir);
-            if src.exists() {
-                let collisions = collision::detect_collisions(&src, &project_dir.join(dir));
-                for rel in collisions {
-                    all_collisions.push(PathBuf::from(*dir).join(rel));
-                }
+        let src = temp_path.join("docs");
+        if src.exists() {
+            let collisions = collision::detect_collisions(&src, &project_dir.join("docs"));
+            for rel in collisions {
+                all_collisions.push(PathBuf::from("docs").join(rel));
             }
         }
         for name in &crates {
@@ -782,12 +900,26 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
         }
     }
 
+    let ffi_readme_src = temp_path.join("crates/ffi/README.md");
+    let ffi_readme_dest = project_dir.join("crates/ffi/README.md");
+    if ffi_readme_src.exists() {
+        if !ffi_readme_dest.exists() || on_collision == OnCollision::Overwrite {
+            fs::create_dir_all(project_dir.join("crates/ffi"))?;
+            fs::copy(&ffi_readme_src, &ffi_readme_dest)
+                .context("failed to copy crates/ffi/README.md")?;
+        }
+    }
+
     let uniffi_dest = project_dir.join("uniffi.toml");
     if !uniffi_dest.exists() || on_collision == OnCollision::Overwrite {
         let uniffi_src = temp_path.join("uniffi.toml");
         if uniffi_src.exists() {
             fs::copy(&uniffi_src, &uniffi_dest).context("failed to copy uniffi.toml")?;
         }
+    }
+
+    if !args.demo {
+        template::strip_demo_uniffi_external_packages(project_dir)?;
     }
 
     let bindings_dir = project_dir.join("bindings");
@@ -804,13 +936,19 @@ fn clone_template_assets(project_dir: &Path, args: &MigrateArgs) -> Result<()> {
         }
     }
 
+    if copy_examples {
+        let src = temp_path.join("examples");
+        let dest = project_dir.join("examples");
+        if src.exists() {
+            template::copy_dir_recursive(&src, &dest, on_collision)?;
+        }
+    }
+
     if args.demo {
-        for dir in &["examples", "docs"] {
-            let src = temp_path.join(dir);
-            let dest = project_dir.join(dir);
-            if src.exists() {
-                template::copy_dir_recursive(&src, &dest, on_collision)?;
-            }
+        let src = temp_path.join("docs");
+        let dest = project_dir.join("docs");
+        if src.exists() {
+            template::copy_dir_recursive(&src, &dest, on_collision)?;
         }
         for name in &demo_crates {
             for prefix in &["crates/lib", "crates/ffi"] {
@@ -884,52 +1022,6 @@ go_mod = "github.com/OWNER/REPO/bindings/go"
     Ok(())
 }
 
-fn create_ffi_types_crate(project_dir: &Path) -> Result<()> {
-    let types_dir = project_dir.join("crates/ffi/types");
-    if types_dir.exists() {
-        return Ok(());
-    }
-
-    let types_src_dir = types_dir.join("src");
-    fs::create_dir_all(&types_src_dir)?;
-
-    let cargo_toml = r#"[package]
-name = "ffi-types"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib", "staticlib", "lib"]
-name = "ffi_types"
-
-[features]
-wasm = ["uniffi/wasm-unstable-single-threaded", "uniffi/scaffolding-ffi-buffer-fns", "dep:uniffi-runtime-wasm"]
-
-[dependencies]
-uniffi = { version = "0.31" }
-uniffi-runtime-wasm = { version = "0.31.0-6", optional = true }
-"#;
-
-    fs::write(types_dir.join("Cargo.toml"), cargo_toml)?;
-
-    let lib_rs = r#"#[cfg(target_arch = "wasm32")]
-extern crate uniffi_runtime_wasm as _;
-
-uniffi::setup_scaffolding!();
-
-// Add shared FFI types here.
-// Example:
-// #[derive(Debug, Clone, uniffi::Record)]
-// pub struct MyType {
-//     pub field: String,
-// }
-"#;
-
-    fs::write(types_src_dir.join("lib.rs"), lib_rs)?;
-
-    Ok(())
-}
-
 struct WorkspaceCrate {
     name: String,
     version: String,
@@ -941,7 +1033,7 @@ fn write_workspace_cargo_toml(
     project_dir: &Path,
     crate_name: &str,
     crate_version: &str,
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<String>> {
     let crates = vec![WorkspaceCrate {
         name: crate_name.to_string(),
         version: crate_version.to_string(),
@@ -955,85 +1047,120 @@ fn write_workspace_cargo_toml_multi(
     project_dir: &Path,
     crates: &[WorkspaceCrate],
     member_patterns: &[&str],
-) -> Result<()> {
+) -> Result<std::collections::BTreeSet<String>> {
     let original_toml_path = project_dir.join("Cargo.toml");
 
-    let (edition, license, repository) = if original_toml_path.exists() {
-        let original_content = fs::read_to_string(&original_toml_path)?;
-        let original_doc = original_content.parse::<toml_edit::DocumentMut>()?;
-        (
-            original_doc
-                .get("package")
-                .and_then(|p| p.get("edition"))
-                .and_then(|e| e.as_str())
-                .unwrap_or("2021")
-                .to_string(),
-            original_doc
-                .get("package")
-                .and_then(|p| p.get("license"))
-                .and_then(|l| l.as_str())
-                .map(String::from),
-            original_doc
-                .get("package")
-                .and_then(|p| p.get("repository"))
-                .and_then(|r| r.as_str())
-                .map(String::from),
-        )
+    let original_doc = if original_toml_path.exists() {
+        let content = fs::read_to_string(&original_toml_path)?;
+        Some(content.parse::<toml_edit::DocumentMut>()?)
     } else {
-        ("2021".to_string(), None, None)
+        None
     };
 
-    let mut workspace_pkg = format!("edition = \"{edition}\"\n");
-    if let Some(lic) = &license {
-        workspace_pkg.push_str(&format!("license = \"{lic}\"\n"));
-    }
-    if let Some(repo) = &repository {
-        workspace_pkg.push_str(&format!("repository = \"{repo}\"\n"));
-    }
+    let mut doc = toml_edit::DocumentMut::new();
 
-    let members_str = member_patterns
-        .iter()
-        .chain(std::iter::once(&"crates/ffi/*"))
-        .map(|p| format!("    \"{p}\","))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut ws = toml_edit::Table::new();
 
-    let mut deps = String::new();
-    for c in crates {
-        deps.push_str(&format!(
-            "{} = {{ path = \"{}\", version = \"{}\" }}\n",
-            c.name, c.path, c.version
-        ));
-        if c.has_ffi {
-            deps.push_str(&format!(
-                "{}-ffi = {{ path = \"crates/ffi/{}\", version = \"0.1.0\" }}\n",
-                c.name, c.name
-            ));
+    let mut members_arr = toml_edit::Array::new();
+    for p in member_patterns {
+        members_arr.push(*p);
+    }
+    members_arr.push("crates/ffi/*");
+    ws.insert("members", toml_edit::Item::Value(toml_edit::Value::Array(members_arr)));
+
+    let mut exclude_arr = toml_edit::Array::new();
+    exclude_arr.push("crates/ffi/tools");
+    ws.insert("exclude", toml_edit::Item::Value(toml_edit::Value::Array(exclude_arr)));
+
+    ws.insert("resolver", toml_edit::Item::Value("2".into()));
+
+    let mut ws_pkg = if let Some(ref orig) = original_doc {
+        orig.get("workspace")
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.as_table())
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        toml_edit::Table::new()
+    };
+
+    if ws_pkg.is_empty() {
+        if let Some(ref orig) = original_doc {
+            let pkg = orig.get("package");
+            let get_str = |key| {
+                pkg.and_then(|p| p.get(key))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            let edition = get_str("edition").unwrap_or_else(|| "2021".to_string());
+            ws_pkg.insert("edition", toml_edit::Item::Value(edition.into()));
+            for field in &["license", "repository", "rust-version", "authors", "description", "homepage"] {
+                if let Some(val) = pkg.and_then(|p| p.get(field)) {
+                    ws_pkg.insert(field, val.clone());
+                }
+            }
+        } else {
+            ws_pkg.insert("edition", toml_edit::Item::Value("2021".into()));
         }
     }
-    deps.push_str("ffi-types = { path = \"crates/ffi/types\", version = \"0.1.0\" }\n");
-    deps.push_str("uniffi = { version = \"0.31\" }\n");
-    deps.push_str("uniffi-runtime-wasm = { version = \"0.31.0-6\" }\n");
 
-    let cargo_toml = format!(
-        r#"[workspace]
-members = [
-{members_str}
-]
-exclude = [
-    "crates/ffi/tools",
-]
-resolver = "2"
+    if !ws_pkg.contains_key("edition") {
+        ws_pkg.insert("edition", toml_edit::Item::Value("2021".into()));
+    }
 
-[workspace.package]
-{workspace_pkg}
-[workspace.dependencies]
-{deps}"#
-    );
+    let ws_pkg_fields: std::collections::BTreeSet<String> = ws_pkg
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .collect();
 
-    fs::write(&original_toml_path, cargo_toml)?;
+    ws.insert("package", toml_edit::Item::Table(ws_pkg));
 
-    Ok(())
+    let mut deps = toml_edit::Table::new();
+    if let Some(ref orig) = original_doc {
+        if let Some(existing_deps) = orig
+            .get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+        {
+            for (key, val) in existing_deps.iter() {
+                deps.insert(key, val.clone());
+            }
+        }
+    }
+    for c in crates {
+        if !deps.contains_key(&c.name) {
+            let mut inline = toml_edit::InlineTable::new();
+            inline.insert("path", toml_edit::Value::from(c.path.as_str()));
+            inline.insert("version", toml_edit::Value::from(c.version.as_str()));
+            deps.insert(&c.name, toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)));
+        }
+        if c.has_ffi {
+            let ffi_name = format!("{}-ffi", c.name);
+            if !deps.contains_key(&ffi_name) {
+                let mut inline = toml_edit::InlineTable::new();
+                inline.insert("path", toml_edit::Value::from(format!("crates/ffi/{}", c.name)));
+                inline.insert("version", toml_edit::Value::from("0.1.0"));
+                deps.insert(&ffi_name, toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)));
+            }
+        }
+    }
+    if !deps.contains_key("uniffi") {
+        let mut inline = toml_edit::InlineTable::new();
+        inline.insert("version", toml_edit::Value::from("0.31"));
+        deps.insert("uniffi", toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)));
+    }
+    if !deps.contains_key("uniffi-runtime-wasm") {
+        let mut inline = toml_edit::InlineTable::new();
+        inline.insert("version", toml_edit::Value::from("0.31.0-6"));
+        deps.insert("uniffi-runtime-wasm", toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)));
+    }
+    ws.insert("dependencies", toml_edit::Item::Table(deps));
+
+    doc.insert("workspace", toml_edit::Item::Table(ws));
+
+    fs::write(&original_toml_path, doc.to_string())?;
+
+    Ok(ws_pkg_fields)
 }
 
 fn add_ffi_to_workspace_toml(project_dir: &Path, crate_names: &[String]) -> Result<()> {
@@ -1091,16 +1218,6 @@ fn add_ffi_to_workspace_toml(project_dir: &Path, crate_names: &[String]) -> Resu
                         toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)),
                     );
                 }
-            }
-
-            if !deps.contains_key("ffi-types") {
-                let mut inline = toml_edit::InlineTable::new();
-                inline.insert("path", toml_edit::Value::from("crates/ffi/types"));
-                inline.insert("version", toml_edit::Value::from("0.1.0"));
-                deps.insert(
-                    "ffi-types",
-                    toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)),
-                );
             }
 
             if !deps.contains_key("uniffi") {

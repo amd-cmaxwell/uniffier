@@ -50,7 +50,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         args.repo_name.as_deref(),
     )?;
 
-    template::stamp_example_imports(Path::new("."), &identity.owner, &identity.name)?;
+    template::stamp_template_placeholders(Path::new("."), &identity.owner, &identity.name)?;
 
     let targets = resolve_targets(args.python, args.go, args.js, args.web, args.all);
 

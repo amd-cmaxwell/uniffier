@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -19,6 +20,10 @@ pub struct NewArgs {
     /// Keep the demo crates (complex, polynomials, etc.) instead of stripping them
     #[arg(long)]
     pub demo: bool,
+
+    /// Skip interactive prompts, use defaults
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 
     /// Skip generating example crates and skeleton binding examples
     #[arg(long)]
@@ -44,6 +49,29 @@ pub fn run(args: NewArgs) -> Result<()> {
         style(args.path.display()).bold()
     );
 
+    if args.no_examples && !args.demo {
+        if !args.yes && std::io::stdin().is_terminal() {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+            let proceed = dialoguer::Confirm::new()
+                .with_prompt("Continue without examples?")
+                .default(false)
+                .interact()?;
+            if !proceed {
+                bail!("aborted");
+            }
+        } else {
+            eprintln!(
+                "{} Skipping example generation. `ffi test` and `make test-*` will not work \
+                 until you manually create the expected test structure in `examples/`.",
+                style("⚠").yellow()
+            );
+        }
+    }
+
     std::fs::create_dir_all(&args.path)?;
 
     let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
@@ -56,6 +84,8 @@ pub fn run(args: NewArgs) -> Result<()> {
         eprintln!("  Stripping demo crates...");
         template::strip_example_crates(&args.path, &name, args.no_examples)?;
     }
+
+    template::write_project_readme(&args.path, true)?;
 
     eprintln!("  Initializing git repository...");
     template::init_git_repo(&args.path)?;

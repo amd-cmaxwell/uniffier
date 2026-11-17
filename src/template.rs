@@ -194,6 +194,49 @@ pub fn templatize(project_dir: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn strip_demo_uniffi_external_packages(project_dir: &Path) -> Result<()> {
+    let uniffi_toml_path = project_dir.join("uniffi.toml");
+    if !uniffi_toml_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&uniffi_toml_path)?;
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse uniffi.toml")?;
+
+    let modified = if let Some(ext) = doc
+        .get_mut("bindings")
+        .and_then(|b| b.get_mut("python"))
+        .and_then(|p| p.get_mut("external_packages"))
+        .and_then(|e| e.as_table_like_mut())
+    {
+        let demo_keys: Vec<String> = ext
+            .iter()
+            .filter(|(k, _)| {
+                TEMPLATE_PREFIXES
+                    .iter()
+                    .any(|(prefix, _)| k.contains(prefix))
+            })
+            .map(|(k, _)| k.to_string())
+            .collect();
+
+        let had_removals = !demo_keys.is_empty();
+        for key in demo_keys {
+            ext.remove(&key);
+        }
+        had_removals
+    } else {
+        false
+    };
+
+    if modified {
+        fs::write(&uniffi_toml_path, doc.to_string())?;
+    }
+
+    Ok(())
+}
+
 pub fn strip_example_crates(project_dir: &Path, project_name: &str, no_examples: bool) -> Result<()> {
     let ffi_dir = project_dir.join("crates/ffi");
     if ffi_dir.is_dir() {
@@ -229,14 +272,32 @@ pub fn strip_example_crates(project_dir: &Path, project_name: &str, no_examples:
 
     if !no_examples {
         write_skeleton_examples(project_dir, project_name)?;
+    } else {
+        let examples_dir = project_dir.join("examples");
+        if examples_dir.is_dir() {
+            for entry in fs::read_dir(&examples_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if name == "README.md" {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path)?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+            }
+        }
     }
 
     strip_docs(project_dir)?;
+    strip_demo_uniffi_external_packages(project_dir)?;
 
     Ok(())
 }
 
-fn generate_example_foo_lib(project_dir: &Path) -> Result<()> {
+pub fn generate_example_foo_lib(project_dir: &Path) -> Result<()> {
     let crate_dir = project_dir.join("crates/lib/example-foo");
     let src_dir = crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
@@ -262,7 +323,7 @@ fn generate_example_foo_lib(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn generate_example_foo_ffi(project_dir: &Path) -> Result<()> {
+pub fn generate_example_foo_ffi(project_dir: &Path) -> Result<()> {
     let crate_dir = project_dir.join("crates/ffi/example-foo");
     let src_dir = crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
@@ -274,15 +335,21 @@ fn generate_example_foo_ffi(project_dir: &Path) -> Result<()> {
          version = \"0.1.0\"\n\
          edition.workspace = true\n\n\
          [lib]\n\
-         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\n\
+         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\
+         name = \"example_foo_ffi\"\n\n\
+         [features]\n\
+         wasm = [\"uniffi/wasm-unstable-single-threaded\", \"uniffi/scaffolding-ffi-buffer-fns\", \"dep:uniffi-runtime-wasm\"]\n\n\
          [dependencies]\n\
-         example-foo.workspace = true\n\
-         uniffi.workspace = true\n",
+         uniffi.workspace = true\n\
+         uniffi-runtime-wasm = { workspace = true, optional = true }\n\
+         example-foo.workspace = true\n",
     ).context("failed to write example-foo-ffi Cargo.toml")?;
 
     fs::write(
         src_dir.join("lib.rs"),
-        "use uniffi;\n\n\
+        "#[cfg(target_arch = \"wasm32\")]\n\
+         extern crate uniffi_runtime_wasm as _;\n\n\
+         uniffi::setup_scaffolding!();\n\n\
          #[uniffi::export]\n\
          pub fn foo(a: &str, b: &str) -> String {\n\
          \x20   example_foo::foo(a, b)\n\
@@ -293,10 +360,16 @@ fn generate_example_foo_ffi(project_dir: &Path) -> Result<()> {
          }\n",
     ).context("failed to write example-foo-ffi lib.rs")?;
 
+    let uniffi_link = crate_dir.join("uniffi.toml");
+    if !uniffi_link.exists() {
+        std::os::unix::fs::symlink("../../../uniffi.toml", &uniffi_link)
+            .context("failed to symlink uniffi.toml into example-foo-ffi")?;
+    }
+
     Ok(())
 }
 
-fn generate_example_types_ffi(project_dir: &Path) -> Result<()> {
+pub fn generate_example_types_ffi(project_dir: &Path) -> Result<()> {
     let crate_dir = project_dir.join("crates/ffi/example-types");
     let src_dir = crate_dir.join("src");
     fs::create_dir_all(&src_dir)?;
@@ -306,17 +379,97 @@ fn generate_example_types_ffi(project_dir: &Path) -> Result<()> {
         "[package]\n\
          name = \"example-types-ffi\"\n\
          version = \"0.1.0\"\n\
-         edition.workspace = true\n\n\
+         edition.workspace = true\n\
+         readme = \"README.md\"\n\n\
          [lib]\n\
-         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\n\
+         crate-type = [\"cdylib\", \"staticlib\", \"lib\"]\n\
+         name = \"example_types_ffi\"\n\n\
+         [features]\n\
+         wasm = [\"uniffi/wasm-unstable-single-threaded\", \"uniffi/scaffolding-ffi-buffer-fns\", \"dep:uniffi-runtime-wasm\"]\n\n\
          [dependencies]\n\
-         uniffi.workspace = true\n",
+         uniffi.workspace = true\n\
+         uniffi-runtime-wasm = { workspace = true, optional = true }\n\
+         thiserror = \"2\"\n",
     ).context("failed to write example-types-ffi Cargo.toml")?;
 
     fs::write(
         src_dir.join("lib.rs"),
-        "use uniffi;\n",
+        "// Shared FFI Types Crate (Example)\n\
+         //\n\
+         // This crate demonstrates how to create a shared FFI-only types crate.\n\
+         // Types defined here are exported via UniFFI and available to all\n\
+         // language bindings without being tied to any specific lib crate.\n\
+         //\n\
+         // Use a crate like this when multiple FFI crates need to share common\n\
+         // types (enums, records, errors) across binding boundaries.\n\
+         //\n\
+         // This example crate can be safely deleted once you understand the\n\
+         // pattern — create your own `crates/ffi/<name>` crate to replace it.\n\
+         \n\
+         #[cfg(target_arch = \"wasm32\")]\n\
+         extern crate uniffi_runtime_wasm as _;\n\
+         \n\
+         uniffi::setup_scaffolding!();\n\
+         \n\
+         /// An example shared error type.\n\
+         ///\n\
+         /// FFI crates can depend on this crate and use this error type in their\n\
+         /// exported functions, so all language bindings share a single definition.\n\
+         #[derive(Debug, thiserror::Error, uniffi::Error)]\n\
+         pub enum ExampleError {\n\
+         \x20   #[error(\"{message}\")]\n\
+         \x20   General { message: String },\n\
+         }\n\
+         \n\
+         /// An example shared record type.\n\
+         ///\n\
+         /// Records defined here are visible to every language binding and can be\n\
+         /// passed to or returned from any FFI crate that depends on this one.\n\
+         #[derive(Debug, Clone, uniffi::Record)]\n\
+         pub struct ExampleMetadata {\n\
+         \x20   pub key: String,\n\
+         \x20   pub value: String,\n\
+         }\n",
     ).context("failed to write example-types-ffi lib.rs")?;
+
+    fs::write(
+        crate_dir.join("README.md"),
+        "# example-types-ffi\n\
+         \n\
+         This is an **example** shared FFI types crate. It provides common UniFFI\n\
+         type definitions — errors and records — so that every FFI crate in the\n\
+         workspace can use a single, consistent set of types across all generated\n\
+         language bindings.\n\
+         \n\
+         It is safe to delete once you understand the pattern — create your own\n\
+         `crates/ffi/<name>` crate to replace it.\n\
+         \n\
+         See [`crates/ffi/README.md`](../README.md) for the general pattern.\n\
+         \n\
+         ## Exported types\n\
+         \n\
+         | Type | Kind | Description |\n\
+         |------|------|-------------|\n\
+         | `ExampleError` | `uniffi::Error` | Shared error enum with a `General` variant |\n\
+         | `ExampleMetadata` | `uniffi::Record` | Key-value metadata record |\n\
+         \n\
+         ## Consuming crates\n\
+         \n\
+         Any FFI crate that uses these types should depend on this crate and\n\
+         declare it as an external package in its `uniffi.toml` (or symlink the\n\
+         root `uniffi.toml`) so that UniFFI imports the shared types rather than\n\
+         re-generating them:\n\
+         \n\
+         ```toml\n\
+         [bindings.python.external_packages]\n\
+         example_types_ffi = \"example_types_ffi\"\n\
+         ```\n\
+         \n\
+         > **Important:** This crate does **not** have its own `uniffi.toml`\n\
+         > listing itself as an external package — doing so would prevent UniFFI\n\
+         > from generating the type definitions in the first place. Only consuming\n\
+         > crates should declare it in `external_packages`.\n",
+    ).context("failed to write example-types-ffi README.md")?;
 
     Ok(())
 }
@@ -425,7 +578,7 @@ fn find_import(content: &str, marker: &str) -> Option<String> {
         })
 }
 
-fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()> {
+pub fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()> {
     let ffi_mod = "example_foo_ffi";
     let types_mod = "example_types_ffi";
 
@@ -460,6 +613,7 @@ fn write_skeleton_examples(project_dir: &Path, project_name: &str) -> Result<()>
                  version = \"0.1.0\"\n\
                  requires-python = \">=3.9\"\n\n\
                  [project.scripts]\n\
+                 uniffi-py-demo = \"py_demo:main\"\n\
                  {pkg_name} = \"py_demo:main\"\n\n\
                  [build-system]\n\
                  requires = [\"hatchling\"]\n\
@@ -640,51 +794,294 @@ fn find_npm_scope(content: &str) -> Option<String> {
     })
 }
 
-pub fn stamp_example_imports(project_dir: &Path, repo_owner: &str, repo_name: &str) -> Result<()> {
-    let new_go_base = format!("github.com/{repo_owner}/{repo_name}");
-    let new_npm_scope = format!("@{repo_owner}/");
+pub fn add_example_workspace_deps(project_dir: &Path) -> Result<()> {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml_path)?;
+    let mut doc = content.parse::<toml_edit::DocumentMut>()?;
 
-    let go_main = project_dir.join("examples/go-demo/main.go");
-    if go_main.exists() {
-        let content = fs::read_to_string(&go_main)?;
-        let old_base = content.lines().find_map(|line| {
-            let idx = line.find("/bindings/go/")?;
-            let quote_start = line[..idx].rfind('"')? + 1;
-            Some(line[quote_start..idx].to_string())
-        });
-        if let Some(old_base) = old_base {
-            if old_base != new_go_base {
-                fs::write(&go_main, content.replace(&old_base, &new_go_base))
-                    .context("failed to stamp Go imports")?;
+    if let Some(ws) = doc.get_mut("workspace").and_then(|w| w.as_table_like_mut()) {
+        if let Some(members) = ws.get_mut("members").and_then(|m| m.as_array_mut()) {
+            let has_lib = members.iter().any(|v| v.as_str() == Some("crates/lib/*"));
+            if !has_lib {
+                members.push("crates/lib/*");
+            }
+        }
+
+        if let Some(deps) = ws.get_mut("dependencies").and_then(|d| d.as_table_like_mut()) {
+            let example_deps = [
+                ("example-foo", "crates/lib/example-foo"),
+                ("example-foo-ffi", "crates/ffi/example-foo"),
+                ("example-types-ffi", "crates/ffi/example-types"),
+            ];
+            for (name, path) in &example_deps {
+                if !deps.contains_key(name) {
+                    let mut inline = toml_edit::InlineTable::new();
+                    inline.insert("path", toml_edit::Value::from(*path));
+                    inline.insert("version", toml_edit::Value::from("0.1.0"));
+                    deps.insert(
+                        name,
+                        toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)),
+                    );
+                }
             }
         }
     }
 
-    for rel in &[
+    fs::write(&cargo_toml_path, doc.to_string())?;
+    Ok(())
+}
+
+pub fn add_uniffi_external_packages(
+    project_dir: &Path,
+    packages: &[(&str, &str)],
+) -> Result<()> {
+    let uniffi_toml_path = project_dir.join("uniffi.toml");
+    let content = if uniffi_toml_path.exists() {
+        fs::read_to_string(&uniffi_toml_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .context("failed to parse uniffi.toml")?;
+
+    let bindings = doc
+        .entry("bindings")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("bindings is not a table")?;
+    let python = bindings
+        .entry("python")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("bindings.python is not a table")?;
+    let ext = python
+        .entry("external_packages")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .context("bindings.python.external_packages is not a table")?;
+
+    for (crate_name, module_name) in packages {
+        if !ext.contains_key(crate_name) {
+            ext.insert(crate_name, toml_edit::Item::Value((*module_name).into()));
+        }
+    }
+
+    fs::write(&uniffi_toml_path, doc.to_string())?;
+    Ok(())
+}
+
+pub fn stamp_template_placeholders(
+    project_dir: &Path,
+    repo_owner: &str,
+    repo_name: &str,
+) -> Result<()> {
+    let git_host = "github.com";
+    let npm_scope = repo_owner.to_string();
+
+    let replacements: &[(&str, &str)] = &[
+        ("%GIT_HOST%", git_host),
+        ("%REPO_OWNER%", repo_owner),
+        ("%REPO_NAME%", repo_name),
+        ("%NPM_SCOPE%", &npm_scope),
+    ];
+
+    let stamp_files = [
+        "uniffi.toml",
+        "examples/go-demo/main.go",
         "examples/js-demo/main.mjs",
         "examples/web-demo/main.ts",
         "examples/web-demo/vite.config.ts",
-    ] {
+    ];
+
+    for rel in &stamp_files {
         let path = project_dir.join(rel);
         if !path.exists() {
             continue;
         }
         let content = fs::read_to_string(&path)?;
-        let old_scope = content.lines().find_map(|line| {
-            let idx = line.find("@")?;
-            let rest = &line[idx..];
-            let slash = rest.find('/')?;
-            Some(rest[..slash + 1].to_string())
-        });
-        if let Some(old_scope) = old_scope {
-            if old_scope != new_npm_scope {
-                fs::write(&path, content.replace(&old_scope, &new_npm_scope))
-                    .with_context(|| format!("failed to stamp npm scope in {rel}"))?;
-            }
+        let mut replaced = content.clone();
+
+        for (placeholder, value) in replacements {
+            replaced = replaced.replace(placeholder, value);
+        }
+
+        if replaced != content {
+            fs::write(&path, replaced)
+                .with_context(|| format!("failed to stamp placeholders in {rel}"))?;
         }
     }
 
     Ok(())
+}
+
+pub fn write_project_readme(project_dir: &Path, overwrite: bool) -> Result<()> {
+    let readme_path = project_dir.join("README.md");
+    if readme_path.exists() && !overwrite {
+        return Ok(());
+    }
+
+    let project_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+
+    let ws_description = read_workspace_description(&project_dir.join("Cargo.toml"));
+
+    let lib_crates = scan_crate_dir(&project_dir.join("crates/lib"), ws_description.as_deref())?;
+    let ffi_crates = scan_crate_dir(&project_dir.join("crates/ffi"), ws_description.as_deref())?;
+    let other_crates = scan_crate_dir(&project_dir.join("crates"), ws_description.as_deref())?;
+
+    let has_examples = project_dir.join("examples").is_dir();
+
+    let mut out = String::new();
+    out.push_str(&format!("# {project_name}\n\n"));
+
+    if let Some(desc) = &ws_description {
+        out.push_str(&format!("{desc}\n\n"));
+    }
+
+    out.push_str("## Project structure\n\n");
+    out.push_str("This project uses [UniFFI](https://mozilla.github.io/uniffi-rs/) ");
+    out.push_str("to generate language bindings (Python, Go, JS/WASM) from Rust.\n\n");
+    out.push_str("```\n");
+    out.push_str(&format!("{project_name}/\n"));
+    if !lib_crates.is_empty() {
+        out.push_str("  crates/lib/       # library crates\n");
+    }
+    if !ffi_crates.is_empty() {
+        out.push_str("  crates/ffi/       # UniFFI wrapper crates\n");
+    }
+    if !other_crates.is_empty() {
+        out.push_str("  crates/           # other crates\n");
+    }
+    if has_examples {
+        out.push_str("  examples/         # language-specific usage examples\n");
+    }
+    out.push_str("  bindings/         # generated bindings (output of `ffi build`)\n");
+    out.push_str("```\n\n");
+
+    if !lib_crates.is_empty() {
+        out.push_str("## Library crates\n\n");
+        out.push_str("| Crate | Description |\n");
+        out.push_str("|-------|-------------|\n");
+        for (name, desc) in &lib_crates {
+            out.push_str(&format!("| `{name}` | {desc} |\n"));
+        }
+        out.push('\n');
+    }
+
+    if !ffi_crates.is_empty() {
+        out.push_str("## FFI crates\n\n");
+        out.push_str("Each FFI crate wraps its corresponding library crate ");
+        out.push_str("and exposes a UniFFI-compatible interface.\n\n");
+        out.push_str("| Crate | Description |\n");
+        out.push_str("|-------|-------------|\n");
+        for (name, desc) in &ffi_crates {
+            out.push_str(&format!("| `{name}` | {desc} |\n"));
+        }
+        out.push('\n');
+    }
+
+    if !other_crates.is_empty() {
+        out.push_str("## Other crates\n\n");
+        out.push_str("| Crate | Description |\n");
+        out.push_str("|-------|-------------|\n");
+        for (name, desc) in &other_crates {
+            out.push_str(&format!("| `{name}` | {desc} |\n"));
+        }
+        out.push('\n');
+    }
+
+    if has_examples {
+        out.push_str("## Examples\n\n");
+        let mut example_dirs: Vec<_> = fs::read_dir(project_dir.join("examples"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect();
+        example_dirs.sort_by_key(|e| e.file_name());
+        if !example_dirs.is_empty() {
+            for entry in &example_dirs {
+                let name = entry.file_name().to_string_lossy().to_string();
+                out.push_str(&format!("- `examples/{name}/`\n"));
+            }
+            out.push('\n');
+        }
+    }
+
+    out.push_str("## Getting started\n\n");
+    out.push_str("```sh\n");
+    out.push_str("# Build all bindings\n");
+    out.push_str("ffi build --all\n\n");
+    out.push_str("# Or use Make targets\n");
+    out.push_str("make build\n");
+    out.push_str("```\n\n");
+    out.push_str("See the [Makefile](Makefile) for available targets.\n");
+
+    fs::write(&readme_path, out)?;
+    Ok(())
+}
+
+fn scan_crate_dir(dir: &Path, ws_description: Option<&str>) -> Result<Vec<(String, String)>> {
+    let mut result = Vec::new();
+    if !dir.is_dir() {
+        return Ok(result);
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("Cargo.toml").exists())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if dir_name == "tools" {
+            continue;
+        }
+        let toml_path = entry.path().join("Cargo.toml");
+        let (name, description) = read_crate_name_description(&toml_path, &dir_name, ws_description);
+        result.push((name, description));
+    }
+    Ok(result)
+}
+
+fn read_workspace_description(ws_toml_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(ws_toml_path).ok()?;
+    let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("description"))
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+}
+
+fn read_crate_name_description(toml_path: &Path, fallback: &str, ws_description: Option<&str>) -> (String, String) {
+    let content = match fs::read_to_string(toml_path) {
+        Ok(c) => c,
+        Err(_) => return (fallback.to_string(), String::new()),
+    };
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return (fallback.to_string(), String::new()),
+    };
+    let pkg = doc.get("package");
+    let name = pkg
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or(fallback)
+        .to_string();
+    let description = pkg
+        .and_then(|p| p.get("description"))
+        .and_then(|d| {
+            d.as_str().map(|s| s.to_string()).or_else(|| {
+                d.as_inline_table()
+                    .and_then(|t| t.get("workspace"))
+                    .and_then(|v| v.as_bool())
+                    .and_then(|b| if b { ws_description.map(|s| s.to_string()) } else { None })
+            })
+        })
+        .unwrap_or_default();
+    (name, description)
 }
 
 pub fn init_git_repo(project_dir: &Path) -> Result<()> {

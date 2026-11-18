@@ -1,5 +1,12 @@
 SHELL := /bin/bash
-.PHONY: deps configure install
+.PHONY: rustup deps configure install
+
+rustup:
+	@if command -v rustup &> /dev/null; then \
+		echo "rustup is already installed."; \
+	else \
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
+	fi
 
 deps:
 	@if command -v apt-get &> /dev/null; then \
@@ -19,8 +26,8 @@ deps:
 		exit 1; \
 	fi
 
-configure:
-	rustup default stable
+configure: rustup
+	@. "$$HOME/.cargo/env" 2>/dev/null; rustup default stable
 
 install:
 	@cargo install --path .

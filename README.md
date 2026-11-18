@@ -4,19 +4,55 @@ A CLI tool for bootstrapping and managing Rust FFI projects with [UniFFI](https:
 
 ## Installation
 
+The quickest way to install is with the provided script, which handles installing `make` and system dependencies automatically:
+
 ```sh
-cargo install --path .
+./install.sh
 ```
 
-### Prerequisites
+### Manual Installation
 
-- Rust toolchain
+#### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/)
 - Git
-- `make`
+- `make` — if not already installed:
+
+  | Platform | Command |
+  |----------|---------|
+  | Debian/Ubuntu | `sudo apt-get install -y make` |
+  | Fedora | `sudo dnf install -y make` |
+  | RHEL/CentOS | `sudo yum install -y make` |
+  | Arch | `sudo pacman -S make` |
+  | Alpine | `sudo apk add make` |
+  | macOS | `xcode-select --install` |
+
 - Language-specific toolchains as needed:
   - **Python:** [uv](https://docs.astral.sh/uv/)
   - **Go:** Go toolchain
   - **JavaScript/WASM:** Node.js and npm
+
+Install system dependencies (C compiler, OpenSSL headers) and set the Rust toolchain:
+
+```sh
+make configure
+```
+
+Then install the CLI:
+
+```sh
+make install
+```
+
+### Adding to PATH
+
+If `$HOME/.cargo/bin` is not already in your `PATH`, add it so the `ffi` command is available:
+
+```sh
+echo 'PATH=$HOME/.cargo/bin:$PATH' >> ~/.bashrc && . ~/.bashrc
+```
+
+> On macOS/zsh, use `~/.zshrc` instead of `~/.bashrc`.
 
 ## Quick Start
 

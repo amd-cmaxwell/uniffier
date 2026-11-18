@@ -25,12 +25,10 @@ pub fn resolve(
     let owner = match (cli_owner, &from_remote) {
         (Some(o), _) => o.to_string(),
         (None, Some((o, _))) => o.clone(),
-        (None, None) => {
-            bail!(
-                "cannot determine REPO_OWNER — no git remote configured.\n\
-                 Pass --repo-owner <owner> (e.g. --repo-owner my-org)"
-            );
-        }
+        (None, None) => bail!(
+            "cannot determine REPO_OWNER — no git remote configured.\n\
+             Pass --repo-owner <owner> (e.g. --repo-owner my-org)"
+        ),
     };
 
     let name = match (cli_name, &from_remote) {

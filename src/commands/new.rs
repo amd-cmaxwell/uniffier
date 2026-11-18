@@ -77,10 +77,11 @@ pub fn run(args: NewArgs) -> Result<()> {
     let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
     template::copy_template_to_dest(temp_dir.path(), &args.path, OnCollision::Skip)?;
 
-    eprintln!("  Applying project name...");
-    template::templatize(&args.path, &name)?;
-
-    if !args.demo {
+    if args.demo {
+        eprintln!("  Keeping demo crates as-is...");
+    } else {
+        eprintln!("  Applying project name...");
+        template::templatize(&args.path, &name)?;
         eprintln!("  Stripping demo crates...");
         template::strip_example_crates(&args.path, &name, args.no_examples)?;
     }

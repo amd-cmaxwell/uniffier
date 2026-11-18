@@ -79,8 +79,12 @@ pub fn run(args: InitArgs) -> Result<()> {
     template::copy_template_to_dest(temp_dir.path(), dest, on_collision)?;
     template::merge_gitignore(&clone_path, dest)?;
 
-    eprintln!("  Applying project name...");
-    template::templatize(dest, &name)?;
+    if args.demo {
+        eprintln!("  Keeping demo crates as-is...");
+    } else {
+        eprintln!("  Applying project name...");
+        template::templatize(dest, &name)?;
+    }
 
     if args.no_examples && !args.demo {
         if !args.yes && std::io::stdin().is_terminal() {

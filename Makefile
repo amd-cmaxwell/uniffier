@@ -1,23 +1,25 @@
 SHELL := /bin/bash
-.PHONY: configure install
+.PHONY: deps configure install
 
-configure:
+deps:
 	@if command -v apt-get &> /dev/null; then \
-		sudo apt-get install -y build-essential libssl-dev; \
+		apt-get install -y build-essential libssl-dev; \
 	elif command -v dnf &> /dev/null; then \
-		sudo dnf install -y gcc make openssl-devel; \
+		dnf install -y gcc make openssl-devel; \
 	elif command -v yum &> /dev/null; then \
-		sudo yum install -y gcc make openssl-devel; \
+		yum install -y gcc make openssl-devel; \
 	elif command -v pacman &> /dev/null; then \
-		sudo pacman -S --needed base-devel openssl; \
+		pacman -S --needed base-devel openssl; \
 	elif command -v apk &> /dev/null; then \
-		sudo apk add build-base openssl-dev; \
+		apk add build-base openssl-dev; \
 	elif command -v brew &> /dev/null; then \
 		brew install openssl; \
 	else \
 		echo "Unsupported package manager. Please install a C compiler and OpenSSL development headers manually."; \
 		exit 1; \
 	fi
+
+configure:
 	rustup default stable
 
 install:

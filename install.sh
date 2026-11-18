@@ -25,5 +25,6 @@ if ! command -v make &> /dev/null; then
   fi
 fi
 
+sudo make deps
 make configure
 make install

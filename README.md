@@ -32,7 +32,13 @@ The quickest way to install is with the provided script, which handles installin
   - **Go:** Go toolchain
   - **JavaScript/WASM:** Node.js and npm
 
-Install system dependencies (C compiler, OpenSSL headers) and set the Rust toolchain:
+Install system dependencies (C compiler, OpenSSL headers):
+
+```sh
+sudo make deps
+```
+
+Configure the Rust toolchain:
 
 ```sh
 make configure

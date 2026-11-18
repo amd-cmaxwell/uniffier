@@ -43,6 +43,7 @@ pub fn copy_template_to_dest(
     fs::create_dir_all(dest)?;
     copy_dir_contents(&clone_path, dest, on_collision)
         .context("failed to copy template into destination")?;
+    fs::create_dir_all(dest.join("docs"))?;
     Ok(())
 }
 
@@ -56,7 +57,7 @@ fn copy_dir_contents(src: &Path, dest: &Path, on_collision: OnCollision) -> Resu
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
-        if entry.file_name() == ".gitignore" {
+        if entry.file_name() == ".gitignore" || entry.file_name() == "docs" {
             continue;
         }
 
@@ -291,7 +292,6 @@ pub fn strip_example_crates(project_dir: &Path, project_name: &str, no_examples:
         }
     }
 
-    strip_docs(project_dir)?;
     strip_demo_uniffi_external_packages(project_dir)?;
 
     Ok(())
@@ -526,40 +526,6 @@ fn rewrite_workspace_toml_for_examples(project_dir: &Path, no_examples: bool) ->
     }
 
     fs::write(&cargo_toml_path, doc.to_string()).context("failed to write Cargo.toml")?;
-
-    Ok(())
-}
-
-fn strip_docs(project_dir: &Path) -> Result<()> {
-    let docs_dir = project_dir.join("docs");
-    if !docs_dir.exists() {
-        return Ok(());
-    }
-
-    let keep = [
-        "adr-ffi-crate-separation.md",
-        "bindings-branch-flow.md",
-        "github-actions-plan.md",
-        "makefile-debug-logging.md",
-        "packaging-plan.md",
-        "wasm-packaging-plan.md",
-    ];
-
-    for entry in fs::read_dir(&docs_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !keep.contains(&name_str.as_ref()) {
-            let path = entry.path();
-            if path.is_dir() {
-                fs::remove_dir_all(&path)
-                    .with_context(|| format!("failed to remove docs/{name_str}"))?;
-            } else {
-                fs::remove_file(&path)
-                    .with_context(|| format!("failed to remove docs/{name_str}"))?;
-            }
-        }
-    }
 
     Ok(())
 }

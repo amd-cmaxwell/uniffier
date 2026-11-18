@@ -76,6 +76,8 @@ pub fn run(args: NewArgs) -> Result<()> {
 
     let temp_dir = template::clone_template_to_temp(args.template.as_deref())?;
     template::copy_template_to_dest(temp_dir.path(), &args.path, OnCollision::Skip)?;
+    let clone_path = template::template_clone_path(temp_dir.path());
+    template::merge_gitignore(&clone_path, &args.path)?;
 
     if args.demo {
         eprintln!("  Keeping demo crates as-is...");
